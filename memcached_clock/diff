@@ -1,0 +1,96 @@
+116c116
+< am__memcached_SOURCES_DIST = memcached.c memcached.h hash.c hash.h \
+---
+> am__memcached_SOURCES_DIST = memcached.c memcached.h parsec.c parsec.h hash.c hash.h \
+125c125
+< am_memcached_OBJECTS = memcached-memcached.$(OBJEXT) \
+---
+> am_memcached_OBJECTS = memcached-memcached.$(OBJEXT) memcached-parsec.$(OBJEXT)\
+133c133
+< am__memcached_debug_SOURCES_DIST = memcached.c memcached.h hash.c \
+---
+> am__memcached_debug_SOURCES_DIST = memcached.c memcached.h parsec.c parsec.h hash.c \
+141a142
+> 	memcached_debug-parsec.$(OBJEXT) \
+317c318
+< ACLOCAL = aclocal-1.14
+---
+> ACLOCAL = ${SHELL} /home/interwq/research/memcached-1.4.22/missing aclocal-1.14
+320,323c321,324
+< AUTOCONF = autoconf
+< AUTOHEADER = autoheader
+< AUTOMAKE = automake-1.14
+< AWK = mawk
+---
+> AUTOCONF = ${SHELL} /home/interwq/research/memcached-1.4.22/missing autoconf
+> AUTOHEADER = ${SHELL} /home/interwq/research/memcached-1.4.22/missing autoheader
+> AUTOMAKE = ${SHELL} /home/interwq/research/memcached-1.4.22/missing automake-1.14
+> AWK = gawk
+326c327
+< CFLAGS = -g -O2 -pthread -pthread -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls -fno-strict-aliasing
+---
+> CFLAGS = -g -O2 -pthread -pthread -Wall -Wunused -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls -fno-strict-aliasing
+350c351
+< MAKEINFO = makeinfo
+---
+> MAKEINFO = ${SHELL} /home/interwq/research/memcached-1.4.22/missing makeinfo
+369,373c370,374
+< XSLTPROC = no
+< abs_builddir = /home/interwq/memcached_clock
+< abs_srcdir = /home/interwq/memcached_clock
+< abs_top_builddir = /home/interwq/memcached_clock
+< abs_top_srcdir = /home/interwq/memcached_clock
+---
+> XSLTPROC = /usr/bin/xsltproc
+> abs_builddir = /home/interwq/research/memcached-1.4.22
+> abs_srcdir = /home/interwq/research/memcached-1.4.22
+> abs_top_builddir = /home/interwq/research/memcached-1.4.22
+> abs_top_srcdir = /home/interwq/research/memcached-1.4.22
+400c401
+< install_sh = ${SHELL} /home/interwq/memcached_clock/install-sh
+---
+> install_sh = ${SHELL} /home/interwq/research/memcached-1.4.22/install-sh
+409c410
+< prefix = /usr/local
+---
+> prefix = /home/interwq/research/m
+426c427
+< testapp_SOURCES = testapp.c util.c util.h $(am__append_2)
+---
+> testapp_SOURCES = testapp.c util.c util.h parsec.c parsec.h $(am__append_2)
+428c429
+< memcached_SOURCES = memcached.c memcached.h hash.c hash.h \
+---
+> memcached_SOURCES = memcached.c memcached.h parsec.c parsec.h hash.c hash.h \
+571a573
+> include ./$(DEPDIR)/memcached-parsec.Po
+702a705,718
+> memcached-parsec.o: parsec.c
+> 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(memcached_CPPFLAGS) $(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS) -MT memcached-parsec.o -MD -MP -MF $(DEPDIR)/memcached-parsec.Tpo -c -o memcached-parsec.o `test -f 'parsec.c' || echo '$(srcdir)/'`parsec.c
+> 	$(AM_V_at)$(am__mv) $(DEPDIR)/memcached-parsec.Tpo $(DEPDIR)/memcached-parsec.Po
+> #	$(AM_V_CC)source='parsec.c' object='memcached-parsec.o' libtool=no \
+> #	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) \
+> #	$(AM_V_CC_no)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(memcached_CPPFLAGS) $(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS) -c -o memcached-parsec.o `test -f 'parsec.c' || echo '$(srcdir)/'`parsec.c
+> 
+> memcached-parsec.obj: parsec.c
+> 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(memcached_CPPFLAGS) $(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS) -MT memcached-parsec.obj -MD -MP -MF $(DEPDIR)/memcached-parsec.Tpo -c -o memcached-parsec.obj `if test -f 'parsec.c'; then $(CYGPATH_W) 'parsec.c'; else $(CYGPATH_W) '$(srcdir)/parsec.c'; fi`
+> 	$(AM_V_at)$(am__mv) $(DEPDIR)/memcached-parsec.Tpo $(DEPDIR)/memcached-parsec.Po
+> #	$(AM_V_CC)source='parsec.c' object='memcached-parsec.obj' libtool=no \
+> #	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) \
+> #	$(AM_V_CC_no)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(memcached_CPPFLAGS) $(CPPFLAGS) $(AM_CFLAGS) $(CFLAGS) -c -o memcached-parsec.obj `if test -f 'parsec.c'; then $(CYGPATH_W) 'parsec.c'; else $(CYGPATH_W) '$(srcdir)/parsec.c'; fi`
+> 
+884a901,914
+> memcached_debug-parsec.o: parsec.c
+> 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(memcached_debug_CFLAGS) $(CFLAGS) -MT memcached_debug-parsec.o -MD -MP -MF $(DEPDIR)/memcached_debug-parsec.Tpo -c -o memcached_debug-parsec.o `test -f 'parsec.c' || echo '$(srcdir)/'`parsec.c
+> 	$(AM_V_at)$(am__mv) $(DEPDIR)/memcached_debug-parsec.Tpo $(DEPDIR)/memcached_debug-parsec.Po
+> #	$(AM_V_CC)source='parsec.c' object='memcached_debug-parsec.o' libtool=no \
+> #	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) \
+> #	$(AM_V_CC_no)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(memcached_debug_CFLAGS) $(CFLAGS) -c -o memcached_debug-parsec.o `test -f 'parsec.c' || echo '$(srcdir)/'`parsec.c
+> 
+> memcached_debug-parsec.obj: parsec.c
+> 	$(AM_V_CC)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(memcached_debug_CFLAGS) $(CFLAGS) -MT memcached_debug-parsec.obj -MD -MP -MF $(DEPDIR)/memcached_debug-parsec.Tpo -c -o memcached_debug-parsec.obj `if test -f 'parsec.c'; then $(CYGPATH_W) 'parsec.c'; else $(CYGPATH_W) '$(srcdir)/parsec.c'; fi`
+> 	$(AM_V_at)$(am__mv) $(DEPDIR)/memcached_debug-parsec.Tpo $(DEPDIR)/memcached_debug-parsec.Po
+> #	$(AM_V_CC)source='parsec.c' object='memcached_debug-parsec.obj' libtool=no \
+> #	DEPDIR=$(DEPDIR) $(CCDEPMODE) $(depcomp) \
+> #	$(AM_V_CC_no)$(CC) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(memcached_debug_CFLAGS) $(CFLAGS) -c -o memcached_debug-parsec.obj `if test -f 'parsec.c'; then $(CYGPATH_W) 'parsec.c'; else $(CYGPATH_W) '$(srcdir)/parsec.c'; fi`
+> 

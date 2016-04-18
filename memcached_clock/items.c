@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <unistd.h>
 
+#include <ck_spinlock.h>
 /* Forward Declarations */
 static void item_link_q(item *it);
 static void item_unlink_q(item *it);
@@ -31,6 +32,27 @@ typedef struct {
     uint64_t crawler_reclaimed;
     uint64_t lrutail_reflocked;
 } itemstats_t;
+
+ck_spinlock_mcs_t l_clock = CK_SPINLOCK_MCS_INITIALIZER;
+
+#define MCS_LOCK
+#ifdef MCS_LOCK
+
+#define LOCK_CLOCK()  ck_spinlock_mcs_context_t me; 	       \
+                        ck_pr_store_uint(&(me.locked), false); \
+                        ck_pr_store_ptr(&(me.next), NULL);     \
+                        ck_spinlock_mcs_lock(&l_clock, &me)
+
+#define UNLOCK_CLOCK()  ck_spinlock_mcs_unlock(&l_clock, &me)
+#else
+
+#define LOCK_CLOCK()  mutex_lock(&cache_lock);
+#define UNLOCK_CLOCK()  mutex_unlock(&cache_lock);
+
+#endif
+
+/* Used for the CLOCK replacement. */
+static item *hand[LARGEST_ID];
 
 static item *heads[LARGEST_ID];
 static item *tails[LARGEST_ID];
@@ -92,6 +114,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
                     const rel_time_t exptime, const int nbytes,
                     const uint32_t cur_hv) {
     uint8_t nsuffix;
+    ck_spinlock_mcs_context_t second_lock;
     item *it = NULL;
     char suffix[40];
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
@@ -103,129 +126,111 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     if (id == 0)
         return 0;
 
-    mutex_lock(&cache_lock);
-    /* do a quick check if we have any expired items in the tail.. */
-    int tries = 5;
+    LOCK_CLOCK();
+
     /* Avoid hangs if a slab has nothing but refcounted stuff in it. */
-    int tries_lrutail_reflocked = 1000;
-    int tried_alloc = 0;
+    /* int tries_lrutail_reflocked = 1000; */
     item *search;
     item *next_it;
     void *hold_lock = NULL;
-    rel_time_t oldest_live = settings.oldest_live;
 
-    search = tails[id];
-    /* We walk up *only* for locked items. Never searching for expired.
-     * Waste of CPU for almost all deployments */
-    for (; tries > 0 && search != NULL; tries--, search=next_it) {
-        /* we might relink search mid-loop, so search->prev isn't reliable */
-        next_it = search->prev;
-        if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
-            /* We are a crawler, ignore it. */
-            tries++;
-            continue;
+    /* We have no expiration. Try alloc a new one first. */
+    if ((it = slabs_alloc(ntotal, id)) == NULL) {
+        /* doing CLOCK eviction */
+        search = hand[id];
+        if (!search) {
+            /* no mem from alloc or replace */
+            UNLOCK_CLOCK();
+            return NULL;
         }
 
-        uint32_t hv = hash(ITEM_key(search), search->nkey);
-        /* Attempt to hash item lock the "search" item. If locked, no
-         * other callers can incr the refcount
-         */
-        /* Don't accidentally grab ourselves, or bail if we can't quicklock */
-        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL)
-            continue;
-        /* Now see if the item is refcount locked */
-        if (refcount_incr(&search->refcount) != 2) {
-            /* Avoid pathological case with ref'ed items in tail */
-            do_item_update_nolock(search);
-            tries_lrutail_reflocked--;
-            tries++;
-            refcount_decr(&search->refcount);
-            itemstats[id].lrutail_reflocked++;
-            /* Old rare bug could cause a refcount leak. We haven't seen
-             * it in years, but we leave this code in to prevent failures
-             * just in case */
-            if (settings.tail_repair_time &&
-                    search->time + settings.tail_repair_time < current_time) {
-                itemstats[id].tailrepairs++;
-                search->refcount = 1;
-                do_item_unlink_nolock(search, hv);
+        /* scan loop of the clock, which could be potentially
+         * unbounded -- we may want an upper limit for it. */
+        for (search = hand[id]; search != NULL; search = next_it) {
+            assert(search);
+            /* we might relink search mid-loop, so search->prev isn't reliable */
+            next_it = search->prev;
+//            if (*key == 101) printf("aaa %d\n", sizes[id]);
+            if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
+                /* We are a crawler, ignore it. */
+                continue;
             }
-            if (hold_lock)
-                item_trylock_unlock(hold_lock);
+            uint32_t hv = hash(ITEM_key(search), search->nkey);
+            /* Attempt to hash item lock the "search" item. If locked, no
+             * other callers can incr the refcount
+             */
+            /* Don't accidentally grab ourselves, or bail if we can't quicklock */
+            if (hv == cur_hv || (hold_lock = item_try_mcslock(hv, &second_lock)) == NULL)
+                continue;
+            /* Now see if the item is refcount locked */
+            if (refcount_incr(&search->refcount) != 2) {
+                /* Avoid pathological case with ref'ed items in tail */
+                do_item_update_nolock(search);
+                /* tries_lrutail_reflocked--; */
+                refcount_decr(&search->refcount);
+                itemstats[id].lrutail_reflocked++;
+                /* Old rare bug could cause a refcount leak. We haven't seen
+                 * it in years, but we leave this code in to prevent failures
+                 * just in case */
+                if (settings.tail_repair_time &&
+                    search->time + settings.tail_repair_time < current_time) {
+                    itemstats[id].tailrepairs++;
+                    search->refcount = 1;
+                    do_item_unlink_nolock(search, hv);
+                }
+                if (hold_lock)
+                    item_try_mcsunlock(hold_lock, &second_lock);
 
-            if (tries_lrutail_reflocked < 1)
-                break;
+                /* if (tries_lrutail_reflocked < 1) */
+                /*     break; */
 
-            continue;
-        }
+                continue;
+            }
 
-        /* Expired or flushed -- disabled */
-        if (0) {/* (search->exptime != 0 && search->exptime < current_time) */
-            /* || (search->time <= oldest_live && oldest_live <= current_time)) { */
-            itemstats[id].reclaimed++;
+            if (search->recency) {
+                /* recently accessed. clear bit and continue. */
+                search->recency = 0;
+                continue;
+            }
+
+//            printf("aaa %d, %d\n", sizes[id], *key);
+
+            itemstats[id].evicted++;
+            itemstats[id].evicted_time = current_time - search->time;
+            if (search->exptime != 0)
+                itemstats[id].evicted_nonzero++;
             if ((search->it_flags & ITEM_FETCHED) == 0) {
-                itemstats[id].expired_unfetched++;
+                itemstats[id].evicted_unfetched++;
             }
             it = search;
             slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
             do_item_unlink_nolock(it, hv);
             /* Initialize the item block: */
             it->slabs_clsid = 0;
-        } else if ((it = slabs_alloc(ntotal, id)) == NULL) {
-            printf("should not be evicting...\n");
-            tried_alloc = 1;
-            if (settings.evict_to_free == 0) {
-                itemstats[id].outofmemory++;
-            } else {
-                itemstats[id].evicted++;
-                itemstats[id].evicted_time = current_time - search->time;
-                if (search->exptime != 0)
-                    itemstats[id].evicted_nonzero++;
-                if ((search->it_flags & ITEM_FETCHED) == 0) {
-                    itemstats[id].evicted_unfetched++;
-                }
-                it = search;
-                slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
-                do_item_unlink_nolock(it, hv);
-                /* Initialize the item block: */
-                it->slabs_clsid = 0;
-
-                /* If we've just evicted an item, and the automover is set to
-                 * angry bird mode, attempt to rip memory into this slab class.
-                 * TODO: Move valid object detection into a function, and on a
-                 * "successful" memory pull, look behind and see if the next alloc
-                 * would be an eviction. Then kick off the slab mover before the
-                 * eviction happens.
-                 */
-                if (settings.slab_automove == 2)
-                    slabs_reassign(-1, id);
-            }
+            
+            refcount_decr(&search->refcount);
+            /* If hash values were equal, we don't grab a second lock */
+            if (hold_lock)
+                item_try_mcsunlock(hold_lock, &second_lock);
+            break;
         }
-
-        refcount_decr(&search->refcount);
-        /* If hash values were equal, we don't grab a second lock */
-        if (hold_lock)
-            item_trylock_unlock(hold_lock);
-        break;
+        /* end of loop*/
     }
-
-    if (!tried_alloc && (tries == 0 || search == NULL))
-        it = slabs_alloc(ntotal, id);
+    /* end of allocation / eviction */
 
     if (it == NULL) {
         itemstats[id].outofmemory++;
-        mutex_unlock(&cache_lock);
+        UNLOCK_CLOCK();
         return NULL;
     }
 
     assert(it->slabs_clsid == 0);
-    assert(it != heads[id]);
 
     /* Item initialization can happen outside of the lock; the item's already
      * been removed from the slab LRU.
      */
     it->refcount = 1;     /* the caller will have a reference */
-    mutex_unlock(&cache_lock);
+    UNLOCK_CLOCK();
     it->next = it->prev = it->h_next = 0;
     it->slabs_clsid = id;
 
@@ -234,7 +239,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     it->nkey = nkey;
     it->nbytes = nbytes;
     memcpy(ITEM_key(it), key, nkey);
-    it->exptime = 0; //exptime;
+    it->exptime = 0; //exptime; /* disable expiration. */
     memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     it->nsuffix = nsuffix;
     return it;
@@ -272,6 +277,7 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     return slabs_clsid(ntotal) != 0;
 }
 
+/* circular ll w/ virtual hand for CLOCK replacement. */
 static void item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
@@ -281,35 +287,56 @@ static void item_link_q(item *it) { /* item is the new head */
     tail = &tails[it->slabs_clsid];
     assert(it != *head);
     assert((*head && *tail) || (*head == 0 && *tail == 0));
-    it->prev = 0;
-    it->next = *head;
-    if (it->next) it->next->prev = it;
-    *head = it;
-    if (*tail == 0) *tail = it;
-    sizes[it->slabs_clsid]++;
 
+    it->prev = *tail;
+    it->next = *head;
+
+    if (it->next) {
+        assert(*tail);
+        it->next->prev = it;
+        (*tail)->next = it;
+    } else { /* first item in the list */
+        assert(*tail == 0);
+        it->next = it->prev = it;
+        assert(hand[it->slabs_clsid] == 0);
+        hand[it->slabs_clsid] = it;
+        *tail = it;
+    }
+
+    *head = it;
+
+    sizes[it->slabs_clsid]++;
     return;
 }
 
+/* Virtual hand is set to it->next after unlink. */
 static void item_unlink_q(item *it) {
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
+    assert(it->next);
+    assert(it->prev);
+
     if (*head == it) {
-        assert(it->prev == 0);
         *head = it->next;
     }
     if (*tail == it) {
-        assert(it->next == 0);
         *tail = it->prev;
     }
-    assert(it->next != it);
-    assert(it->prev != it);
 
-    if (it->next) it->next->prev = it->prev;
-    if (it->prev) it->prev->next = it->next;
+    if (it == it->next) {
+        assert(it == it->prev);
+        assert(*head == *tail);
+        *head = *tail = 0;
+        hand[it->slabs_clsid] = 0;
+    } else {
+        it->next->prev = it->prev;
+        it->prev->next = it->next;
+        hand[it->slabs_clsid] = it->next;
+    }
+
     sizes[it->slabs_clsid]--;
     return;
 }
@@ -317,7 +344,7 @@ static void item_unlink_q(item *it) {
 int do_item_link(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
-    mutex_lock(&cache_lock);
+    LOCK_CLOCK();
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
 
@@ -332,14 +359,15 @@ int do_item_link(item *it, const uint32_t hv) {
     assoc_insert(it, hv);
     item_link_q(it);
     refcount_incr(&it->refcount);
-    mutex_unlock(&cache_lock);
+
+    UNLOCK_CLOCK();
 
     return 1;
 }
 
 void do_item_unlink(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
-    mutex_lock(&cache_lock);
+    LOCK_CLOCK();
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
@@ -350,7 +378,7 @@ void do_item_unlink(item *it, const uint32_t hv) {
         item_unlink_q(it);
         do_item_remove(it);
     }
-    mutex_unlock(&cache_lock);
+    UNLOCK_CLOCK();
 }
 
 /* FIXME: Is it necessary to keep this copy/pasted code? */
@@ -381,6 +409,9 @@ void do_item_remove(item *it) {
 /* Copy/paste to avoid adding two extra branches for all common calls, since
  * _nolock is only used in an uncommon case. */
 void do_item_update_nolock(item *it) {
+#ifdef CLOCK_REPLACEMENT    
+    if (it->recency == 0) it->recency = 1;
+#else
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -391,29 +422,34 @@ void do_item_update_nolock(item *it) {
             item_link_q(it);
         }
     }
+#endif
 }
 
 void do_item_update(item *it) {
+#ifdef CLOCK_REPLACEMENT    
+    if (it->recency == 0) it->recency = 1;
+#else
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
 
-        mutex_lock(&cache_lock);
+        LOCK_CLOCK();
         if ((it->it_flags & ITEM_LINKED) != 0) {
             item_unlink_q(it);
             it->time = current_time;
             item_link_q(it);
         }
-        mutex_unlock(&cache_lock);
+        UNLOCK_CLOCK();
     }
+#endif
 }
 
 int do_item_replace(item *it, item *new_it, const uint32_t hv) {
     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
-
     do_item_unlink(it, hv);
+
     return do_item_link(new_it, hv);
 }
 
@@ -577,7 +613,6 @@ void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     //mutex_lock(&cache_lock);
     item *it = assoc_find(key, nkey, hv);
-
     if (it != NULL) {
         refcount_incr(&it->refcount);
         /* Optimization for slab reassignment. prevents popular items from

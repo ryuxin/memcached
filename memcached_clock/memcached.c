@@ -5537,7 +5537,6 @@ int main (int argc, char **argv) {
     /* initialize main thread libevent instance */
     main_base = event_init();
     settings.maxbytes = MEM_SIZE;
-    settings.oldest_live = 1; /* avoid flushing. */
 
     /* initialize other stuff */
     stats_init();

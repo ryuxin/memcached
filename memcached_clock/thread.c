@@ -62,6 +62,8 @@ static pthread_mutex_t worker_hang_lock;
 static CQ_ITEM *cqi_freelist;
 static pthread_mutex_t cqi_freelist_lock;
 
+static ck_spinlock_mcs_t *item_locks_mcs;
+
 static pthread_mutex_t *item_locks;
 /* size of the item lock hash table */
 static uint32_t item_lock_count;
@@ -102,8 +104,6 @@ unsigned short refcount_incr(unsigned short *refcount) {
 #endif
 }
 
-extern __thread int thd_local_id;
-
 unsigned short refcount_decr(unsigned short *refcount) {
 #ifdef HAVE_GCC_ATOMICS
     return __sync_sub_and_fetch(refcount, 1);
@@ -117,6 +117,38 @@ unsigned short refcount_decr(unsigned short *refcount) {
     mutex_unlock(&atomics_mutex);
     return res;
 #endif
+}
+
+extern __thread int thd_local_id;
+
+struct item_mcslock {
+    ck_spinlock_mcs_context_t l;
+    char padding[CACHE_LINE*2 - sizeof(ck_spinlock_mcs_context_t)];
+} __attribute__((aligned(CACHE_LINE)));
+
+struct item_mcslock item_mcslock[NUM_CPU] __attribute__((aligned(4096)));
+
+void item_mcs_lock(uint32_t hv) {
+    ck_spinlock_mcs_lock(&item_locks_mcs[hv & hashmask(item_lock_hashpower)], &(item_mcslock[thd_local_id].l));
+}
+
+void item_mcs_unlock(uint32_t hv) {
+    ck_spinlock_mcs_unlock(&item_locks_mcs[hv & hashmask(item_lock_hashpower)], &(item_mcslock[thd_local_id].l));
+}
+
+/* try lock/unlock are not on fast path -- they need to pass in the
+ * mcs lock context (from their stack). */
+void *item_try_mcslock(uint32_t hv, void *lock_context) {
+    ck_spinlock_mcs_t *l = &item_locks_mcs[hv & hashmask(item_lock_hashpower)];
+
+    if (ck_spinlock_mcs_trylock(l, lock_context)) {
+        return l;
+    } 
+    return NULL;
+}
+
+void item_try_mcsunlock(void *lock, void *lock_context) {
+    ck_spinlock_mcs_unlock(lock, lock_context);
 }
 
 void item_lock(uint32_t hv) {
@@ -379,9 +411,8 @@ test_get_key(char* key, int nkey)
     it = item_get(key, nkey);
     if (it) {
         item_update(it);
-        /* release the item reference after we are done. */
-        item_remove(it);
-        // shouldn't be accessing it from now on.
+        /* only safe to access before the remove. */
+        item_remove(it);       /* release the item reference */
         return 1;
     }
 
@@ -397,19 +428,14 @@ set_key(char* key, int nkey, char *data, int nbytes)
 
     /* alloc */
     it = item_alloc(key, nkey, 0, 0, nbytes+2);
-    if (unlikely(!it)) {
-        printf("allocation error?\n");
-    }
-    assert(it);
     memcpy(ITEM_data(it), data, nbytes);
 
     /* link / replace */
     hv = hash(ITEM_key(it), it->nkey);
     /* bucket lock */
-    item_lock(hv);
+    item_mcs_lock(hv);
     assert(*key == *ITEM_key(it));
     old_it = do_item_get(key, it->nkey, hv);
-//    printf("b\n");
 
     if (old_it != NULL) {
         item_replace(old_it, it, hv);
@@ -418,11 +444,46 @@ set_key(char* key, int nkey, char *data, int nbytes)
         do_item_link(it, hv);
     }
     /* unlock */
-    item_unlock(hv);
+    item_mcs_unlock(hv);
 
     item_remove(it);       /* release the item reference */
 
     return 0;
+}
+
+static void test_test(void)
+{
+    int i, j, k;
+    char aaa = 'a';
+    char aa[4];
+    char* str = "asdf";
+    printf("starting...\n");
+
+    aa[0] = aaa;
+    for (i = 0; i < 128; i++) {
+        aa[1] = i;
+        for (j = 0; j < 128; j++) {
+            aa[2] = j;
+            for (k = 0; k < 128; k++) {
+                aa[3] = k;
+                set_key(aa, 4, "wow!", 4);
+            }
+        }
+    }
+    set_key(str, 4, "yay!", 4);
+
+    item *it = item_get("abcd", 4);
+    if (!it) {
+        printf("did not get key ...\n");
+        return;
+    } else {
+        char *v = ITEM_data(it);
+        printf("it %p: %d, %d %c %c %c %c\n", 
+               (void *)it, it->nbytes, it->nkey, 
+               v[0], v[1], v[2], v[3]);
+    }
+
+    return;
 }
 
 /*
@@ -553,9 +614,9 @@ item *item_get(const char *key, const size_t nkey) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
-    item_lock(hv);
+    item_mcs_lock(hv);
     it = do_item_get(key, nkey, hv);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
     return it;
 }
 
@@ -563,9 +624,9 @@ item *item_touch(const char *key, size_t nkey, uint32_t exptime) {
     item *it;
     uint32_t hv;
     hv = hash(key, nkey);
-    item_lock(hv);
+    item_mcs_lock(hv);
     it = do_item_touch(key, nkey, exptime, hv);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
     return it;
 }
 
@@ -577,9 +638,9 @@ int item_link(item *item) {
     uint32_t hv;
 
     hv = hash(ITEM_key(item), item->nkey);
-    item_lock(hv);
+    item_mcs_lock(hv);
     ret = do_item_link(item, hv);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
     return ret;
 }
 
@@ -591,9 +652,9 @@ void item_remove(item *item) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
 
-    item_lock(hv);
+    item_mcs_lock(hv);
     do_item_remove(item);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
 }
 
 /*
@@ -611,9 +672,9 @@ int item_replace(item *old_it, item *new_it, const uint32_t hv) {
 void item_unlink(item *item) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
-    item_lock(hv);
+    item_mcs_lock(hv);
     do_item_unlink(item, hv);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
 }
 
 /*
@@ -623,9 +684,9 @@ void item_update(item *item) {
     uint32_t hv;
     hv = hash(ITEM_key(item), item->nkey);
 
-    item_lock(hv);
+    item_mcs_lock(hv);
     do_item_update(item);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
 }
 
 /*
@@ -639,9 +700,9 @@ enum delta_result_type add_delta(conn *c, const char *key,
     uint32_t hv;
 
     hv = hash(key, nkey);
-    item_lock(hv);
+    item_mcs_lock(hv);
     ret = do_add_delta(c, key, nkey, incr, delta, buf, cas, hv);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
     return ret;
 }
 
@@ -653,9 +714,9 @@ enum store_item_type store_item(item *item, int comm, conn* c) {
     uint32_t hv;
 
     hv = hash(ITEM_key(item), item->nkey);
-    item_lock(hv);
+    item_mcs_lock(hv);
     ret = do_store_item(item, comm, c, hv);
-    item_unlock(hv);
+    item_mcs_unlock(hv);
     return ret;
 }
 
@@ -820,6 +881,7 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
         out->cas_badval += stats->slab_stats[sid].cas_badval;
     }
 }
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -855,7 +917,6 @@ void preload_keys(void)
     int bytes;
     char *load_file = "../mc_trace/trace_load_key";
 
-    memset(v, 0, V_LENGTH);
     ret = mlock(ops, N_OPS*(KEY_LENGTH + 1));
 	if (ret) {
 		printf("Cannot lock cache memory (%d). Check privilege. Exit.\n", ret);
@@ -1209,12 +1270,15 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
     item_lock_hashpower = power;
 
     item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
+    item_locks_mcs = calloc(item_lock_count, sizeof(ck_spinlock_mcs_t));
+
     if (! item_locks) {
         perror("Can't allocate item locks");
         exit(1);
     }
     for (i = 0; i < item_lock_count; i++) {
         pthread_mutex_init(&item_locks[i], NULL);
+        item_locks_mcs[i] = CK_SPINLOCK_MCS_INITIALIZER;
     }
 
     threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));

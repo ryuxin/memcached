@@ -13,7 +13,7 @@
 #define TRACE_FILE "../mc_trace/trace20p_key"
 
 // for 99 percentile w/ limited memory
-#define THRES (10000000)
+#define THRES (600000)
 
 #define CACHE_LINE 64
 #define MEM_SIZE (512*1024*1024)
@@ -349,6 +349,9 @@ extern struct settings settings;
 
 #define ITEM_FETCHED 8
 
+// the following disables LRU.
+#define CLOCK_REPLACEMENT
+
 /**
  * Structure for storing items within memcached.
  */
@@ -356,6 +359,9 @@ typedef struct _stritem {
     struct _stritem *next;
     struct _stritem *prev;
     struct _stritem *h_next;    /* hash chain next */
+#ifdef CLOCK_REPLACEMENT
+    uint8_t         recency;   /* QW: recent used bit in CLOCK replacement */
+#endif
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
@@ -584,6 +590,11 @@ void  item_stats_totals(ADD_STAT add_stats, void *c);
 void  item_stats_sizes(ADD_STAT add_stats, void *c);
 void  item_unlink(item *it);
 void  item_update(item *it);
+
+void item_mcs_lock(uint32_t hv);
+void item_mcs_unlock(uint32_t hv);
+void *item_try_mcslock(uint32_t hv, void *lock_context);
+void item_try_mcsunlock(void *lock, void *lock_context);
 
 void item_lock(uint32_t hv);
 void *item_trylock(uint32_t hv);
