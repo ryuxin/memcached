@@ -55,6 +55,8 @@
 #endif
 #endif
 
+__thread int thd_local_id;
+
 /*
  * forward declarations
  */
@@ -5424,6 +5426,7 @@ int main (int argc, char **argv) {
     } else {
         settings.num_threads_per_udp = settings.num_threads;
     }
+    settings.num_threads = NUM_CPU;
 
     if (settings.sasl) {
         if (!protocol_specified) {
@@ -5486,7 +5489,7 @@ int main (int argc, char **argv) {
     }
 
     /* lose root privileges if we have them */
-    if (getuid() == 0 || geteuid() == 0) {
+    if (0) {//getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
             fprintf(stderr, "can't run as root without the -u switch\n");
             exit(EX_USAGE);
@@ -5533,6 +5536,8 @@ int main (int argc, char **argv) {
 
     /* initialize main thread libevent instance */
     main_base = event_init();
+    settings.maxbytes = MEM_SIZE;
+    settings.oldest_live = 1; /* avoid flushing. */
 
     /* initialize other stuff */
     stats_init();
@@ -5550,6 +5555,9 @@ int main (int argc, char **argv) {
     }
     /* start up worker threads if MT mode */
     memcached_thread_init(settings.num_threads, main_base);
+
+    printf("MC: exiting...\n");
+    exit(0);
 
     if (start_assoc_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);

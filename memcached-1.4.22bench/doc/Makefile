@@ -75,9 +75,9 @@ POST_INSTALL = :
 NORMAL_UNINSTALL = :
 PRE_UNINSTALL = :
 POST_UNINSTALL = :
-build_triplet = x86_64-unknown-linux-gnu
-host_triplet = x86_64-unknown-linux-gnu
-target_triplet = x86_64-unknown-linux-gnu
+build_triplet = i686-pc-linux-gnu
+host_triplet = i686-pc-linux-gnu
+target_triplet = i686-pc-linux-gnu
 #am__append_1 = protocol-binary.txt protocol-binary-range.txt
 subdir = doc
 DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/Makefile.am
@@ -142,16 +142,16 @@ NROFF = nroff
 MANS = $(man_MANS)
 am__tagged_files = $(HEADERS) $(SOURCES) $(TAGS_FILES) $(LISP)
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
-ACLOCAL = ${SHELL} /home/dormando/d/p/danga/git/memcached/missing aclocal-1.14
+ACLOCAL = ${SHELL} /home/interwq/memcached-1.4.22/missing aclocal-1.14
 AMTAR = $${TAR-tar}
 AM_DEFAULT_VERBOSITY = 1
-AUTOCONF = ${SHELL} /home/dormando/d/p/danga/git/memcached/missing autoconf
-AUTOHEADER = ${SHELL} /home/dormando/d/p/danga/git/memcached/missing autoheader
-AUTOMAKE = ${SHELL} /home/dormando/d/p/danga/git/memcached/missing automake-1.14
-AWK = gawk
+AUTOCONF = ${SHELL} /home/interwq/memcached-1.4.22/missing autoconf
+AUTOHEADER = ${SHELL} /home/interwq/memcached-1.4.22/missing autoheader
+AUTOMAKE = ${SHELL} /home/interwq/memcached-1.4.22/missing automake-1.14
+AWK = mawk
 CC = gcc -std=gnu99
 CCDEPMODE = depmode=gcc3
-CFLAGS = -g -O2 -pthread -pthread -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls
+CFLAGS = -g -O2 -pthread -pthread -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls -fno-strict-aliasing
 CPP = gcc -E
 CPPFLAGS = 
 CYGPATH_W = echo
@@ -173,9 +173,9 @@ INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LDFLAGS = 
 LIBOBJS = 
-LIBS = -levent 
+LIBS = -levent -lrt 
 LTLIBOBJS = 
-MAKEINFO = ${SHELL} /home/dormando/d/p/danga/git/memcached/missing makeinfo
+MAKEINFO = ${SHELL} /home/interwq/memcached-1.4.22/missing makeinfo
 MKDIR_P = /bin/mkdir -p
 OBJEXT = o
 PACKAGE = memcached
@@ -195,10 +195,10 @@ STRIP =
 VERSION = 1.4.22
 XML2RFC = no
 XSLTPROC = no
-abs_builddir = /home/dormando/d/p/danga/git/memcached/doc
-abs_srcdir = /home/dormando/d/p/danga/git/memcached/doc
-abs_top_builddir = /home/dormando/d/p/danga/git/memcached
-abs_top_srcdir = /home/dormando/d/p/danga/git/memcached
+abs_builddir = /home/interwq/memcached-1.4.22/doc
+abs_srcdir = /home/interwq/memcached-1.4.22/doc
+abs_top_builddir = /home/interwq/memcached-1.4.22
+abs_top_srcdir = /home/interwq/memcached-1.4.22
 ac_ct_CC = gcc
 am__include = include
 am__leading_dot = .
@@ -206,26 +206,26 @@ am__quote =
 am__tar = $${TAR-tar} chof - "$$tardir"
 am__untar = $${TAR-tar} xf -
 bindir = ${exec_prefix}/bin
-build = x86_64-unknown-linux-gnu
+build = i686-pc-linux-gnu
 build_alias = 
-build_cpu = x86_64
+build_cpu = i686
 build_os = linux-gnu
-build_vendor = unknown
+build_vendor = pc
 builddir = .
 datadir = ${datarootdir}
 datarootdir = ${prefix}/share
 docdir = ${datarootdir}/doc/${PACKAGE_TARNAME}
 dvidir = ${docdir}
 exec_prefix = ${prefix}
-host = x86_64-unknown-linux-gnu
+host = i686-pc-linux-gnu
 host_alias = 
-host_cpu = x86_64
+host_cpu = i686
 host_os = linux-gnu
-host_vendor = unknown
+host_vendor = pc
 htmldir = ${docdir}
 includedir = ${prefix}/include
 infodir = ${datarootdir}/info
-install_sh = ${SHELL} /home/dormando/d/p/danga/git/memcached/install-sh
+install_sh = ${SHELL} /home/interwq/memcached-1.4.22/install-sh
 libdir = ${exec_prefix}/lib
 libexecdir = ${exec_prefix}/libexec
 localedir = ${datarootdir}/locale
@@ -241,11 +241,11 @@ sbindir = ${exec_prefix}/sbin
 sharedstatedir = ${prefix}/com
 srcdir = .
 sysconfdir = ${prefix}/etc
-target = x86_64-unknown-linux-gnu
+target = i686-pc-linux-gnu
 target_alias = 
-target_cpu = x86_64
+target_cpu = i686
 target_os = linux-gnu
-target_vendor = unknown
+target_vendor = pc
 top_build_prefix = ../
 top_builddir = ..
 top_srcdir = ..
@@ -492,10 +492,10 @@ uninstall-man: uninstall-man1
 
 
 protocol-binary.txt: $(.TARGET:R).full
-	no -c /home/dormando/d/p/danga/git/memcached/doc $(.TARGET:R).full $@
+	no -c /home/interwq/memcached-1.4.22/doc $(.TARGET:R).full $@
 
 protocol-binary-range.txt: $(.TARGET:R).full
-	no -c /home/dormando/d/p/danga/git/memcached/doc $(.TARGET:R).full $@
+	no -c /home/interwq/memcached-1.4.22/doc $(.TARGET:R).full $@
 
 protocol-binary.full: $(.TARGET:R).xml xml2rfc/rfc2629-noinc.xsl
 	no --nonet xml2rfc/rfc2629-noinc.xsl $(.TARGET:R).xml > $@

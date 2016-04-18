@@ -125,6 +125,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             tries++;
             continue;
         }
+
         uint32_t hv = hash(ITEM_key(search), search->nkey);
         /* Attempt to hash item lock the "search" item. If locked, no
          * other callers can incr the refcount
@@ -158,9 +159,9 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             continue;
         }
 
-        /* Expired or flushed */
-        if ((search->exptime != 0 && search->exptime < current_time)
-            || (search->time <= oldest_live && oldest_live <= current_time)) {
+        /* Expired or flushed -- disabled */
+        if (0) {/* (search->exptime != 0 && search->exptime < current_time) */
+            /* || (search->time <= oldest_live && oldest_live <= current_time)) { */
             itemstats[id].reclaimed++;
             if ((search->it_flags & ITEM_FETCHED) == 0) {
                 itemstats[id].expired_unfetched++;
@@ -171,6 +172,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
             /* Initialize the item block: */
             it->slabs_clsid = 0;
         } else if ((it = slabs_alloc(ntotal, id)) == NULL) {
+            printf("should not be evicting...\n");
             tried_alloc = 1;
             if (settings.evict_to_free == 0) {
                 itemstats[id].outofmemory++;
@@ -232,7 +234,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     it->nkey = nkey;
     it->nbytes = nbytes;
     memcpy(ITEM_key(it), key, nkey);
-    it->exptime = exptime;
+    it->exptime = 0; //exptime;
     memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     it->nsuffix = nsuffix;
     return it;
@@ -285,6 +287,7 @@ static void item_link_q(item *it) { /* item is the new head */
     *head = it;
     if (*tail == 0) *tail = it;
     sizes[it->slabs_clsid]++;
+
     return;
 }
 
@@ -574,6 +577,7 @@ void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     //mutex_lock(&cache_lock);
     item *it = assoc_find(key, nkey, hv);
+
     if (it != NULL) {
         refcount_incr(&it->refcount);
         /* Optimization for slab reassignment. prevents popular items from

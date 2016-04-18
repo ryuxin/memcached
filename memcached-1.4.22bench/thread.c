@@ -15,6 +15,12 @@
 #include <atomic.h>
 #endif
 
+#include <sys/mman.h>
+#include <sched.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <ck_spinlock.h>
+
 #define ITEMS_PER_ALLOC 64
 
 /* An item in the connection queue. */
@@ -95,6 +101,8 @@ unsigned short refcount_incr(unsigned short *refcount) {
     return res;
 #endif
 }
+
+extern __thread int thd_local_id;
 
 unsigned short refcount_decr(unsigned short *refcount) {
 #ifdef HAVE_GCC_ATOMICS
@@ -361,6 +369,60 @@ static void setup_thread(LIBEVENT_THREAD *me) {
         fprintf(stderr, "Failed to create suffix cache\n");
         exit(EXIT_FAILURE);
     }
+}
+
+static int
+test_get_key(char* key, int nkey)
+{
+    item *it;
+
+    it = item_get(key, nkey);
+    if (it) {
+        item_update(it);
+        /* release the item reference after we are done. */
+        item_remove(it);
+        // shouldn't be accessing it from now on.
+        return 1;
+    }
+
+    return 0;
+}
+
+/* alloc + link / replace. Flattened from the state machine. */
+static int
+set_key(char* key, int nkey, char *data, int nbytes)
+{
+    item *old_it, *it;
+    uint32_t hv;
+
+    /* alloc */
+    it = item_alloc(key, nkey, 0, 0, nbytes+2);
+    if (unlikely(!it)) {
+        printf("allocation error?\n");
+    }
+    assert(it);
+    memcpy(ITEM_data(it), data, nbytes);
+
+    /* link / replace */
+    hv = hash(ITEM_key(it), it->nkey);
+    /* bucket lock */
+    item_lock(hv);
+    assert(*key == *ITEM_key(it));
+    old_it = do_item_get(key, it->nkey, hv);
+//    printf("b\n");
+
+    if (old_it != NULL) {
+        item_replace(old_it, it, hv);
+        do_item_remove(old_it);
+    } else {
+        do_item_link(it, hv);
+    }
+    /* unlock */
+    item_unlock(hv);
+
+    item_remove(it);       /* release the item reference */
+
+    return 0;
 }
 
 /*
@@ -758,6 +820,351 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
         out->cas_badval += stats->slab_stats[sid].cas_badval;
     }
 }
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define N_OPS 10000000
+#define N_KEYS 1000000
+
+#define KEY_LENGTH 16
+#define V_LENGTH   (KEY_LENGTH * 2)
+
+char ops[N_OPS][KEY_LENGTH + 1];
+
+#define P99_CALC
+
+#ifdef P99_CALC
+// 99 percentile
+#define N_LOG (N_OPS / 25) //4M * 4 = 16 MB
+#define N_1P  (N_OPS / 100 / NUM_CPU)
+unsigned long p99[N_LOG];
+#endif
+
+static void *worker_bench(void *arg);
+
+int load_trace(void);
+void preload_keys(void);
+
+void preload_keys(void)
+{
+    /* insert all the keys into the cache before accessing the
+     * traces. If the cache is large enough, there will be no miss.*/
+    int fd, i, ret;
+    char buf[KEY_LENGTH + 1], v[V_LENGTH];
+    int bytes;
+    char *load_file = "../mc_trace/trace_load_key";
+
+    memset(v, 0, V_LENGTH);
+    ret = mlock(ops, N_OPS*(KEY_LENGTH + 1));
+	if (ret) {
+		printf("Cannot lock cache memory (%d). Check privilege. Exit.\n", ret);
+		exit(-1);
+	}
+
+#ifdef P99_CALC
+    ret = mlock(p99, N_LOG*(sizeof(unsigned long)));
+	if (ret) {
+		printf("Cannot lock cache memory (%d). Check privilege. Exit.\n", ret);
+		exit(-1);
+	}
+#endif
+
+    fd = open(load_file, O_RDONLY);
+    if (fd < 0) {
+        printf("cannot open file %s. Exit.\n", load_file);
+        exit(-1);
+    }
+
+    for (i = 0; i < N_KEYS; i++) {
+        bytes = read(fd, buf, KEY_LENGTH + 1);
+        assert(bytes == KEY_LENGTH + 1);
+
+        memcpy(v, buf, KEY_LENGTH);
+        memcpy(&v[KEY_LENGTH], buf, KEY_LENGTH);
+
+        ret = set_key(buf, KEY_LENGTH, v, V_LENGTH);
+        assert(ret == 0);
+    }
+    close(fd);
+}
+
+int load_trace(void)
+{
+    int fd;
+    int bytes;
+    unsigned long i;
+    char buf[KEY_LENGTH + 2];
+
+    printf("loading trace file @%s...\n", TRACE_FILE);
+    /* read the entire trace into memory. */
+    fd = open(TRACE_FILE, O_RDONLY);
+    if (fd < 0) {
+        printf("cannot open file %s. Exit.\n", TRACE_FILE);
+        exit(-1);
+    }
+    
+    for (i = 0; i < N_OPS; i++) {
+        bytes = read(fd, buf, KEY_LENGTH+2);
+        assert(bytes == KEY_LENGTH + 2);
+        assert(buf[KEY_LENGTH + 1] == '\n');
+        memcpy(ops[i], buf, KEY_LENGTH + 1);
+    }
+    close(fd);
+
+    return 0;
+}
+
+#define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A" (val))
+
+#ifdef P99_CALC
+//#define AVG   (800)
+//#define THRES (2*AVG)
+static int cmpfunc(const void * a, const void * b)
+{
+    return ( *(int*)a - *(int*)b );
+}
+#endif
+
+static void 
+bench(void)
+{
+    int i, ret;
+    unsigned long n_read = 0, n_update = 0;
+#ifdef P99_CALC
+    unsigned long n_large = 0;
+#endif
+    char *op, value[V_LENGTH], key[KEY_LENGTH];
+    int id = thd_local_id, jump = settings.num_threads;
+    unsigned long long s, e, s1, e1, tot_cost = 0, max = 0, cost;
+
+    /* prepare the value -- no real database op needed. */
+    memset(value, 1, V_LENGTH);
+
+    rdtscll(s);
+    for (i = id; i < N_OPS; i += jump) {
+        op = ops[i];
+        memcpy(key, &op[1], KEY_LENGTH);
+//        key = &op[1];
+
+        rdtscll(s1);        
+        if (*op == 'R') {
+            n_read++;
+
+            ret = test_get_key(key, KEY_LENGTH);
+            assert(ret);
+            if (!ret) {
+                /* If get returns null, do a set. */
+                n_update++;
+                ret = set_key(key, KEY_LENGTH, value, V_LENGTH);
+                assert(ret == 0);
+            }
+            /* char *v = ITEM_data(it); */
+            /* if (it) { */
+            /*     for (j = 0; j < V_LENGTH; j++) { */
+            /*         if (v[j] != op[1 + j % KEY_LENGTH]) { */
+            /*             printf(" %d: %d, %d \n", j, v[j], op[1 + (j % KEY_LENGTH)]); */
+            /*         } */
+            /*         assert(v[j] == op[1 + j % KEY_LENGTH]); */
+            /*     } */
+            /* } */
+        } else {
+            assert(*op == 'U');
+            n_update++;
+
+            ret = set_key(key, KEY_LENGTH, value, V_LENGTH);
+            assert(ret == 0);
+        }
+        rdtscll(e1);
+        cost = e1-s1;
+        tot_cost += cost;
+        if (cost > max) max = cost;
+#ifdef P99_CALC
+        if (id == 0 && cost > THRES) {
+            p99[n_large] = cost;
+            if (n_large < N_LOG - 1) {
+                n_large++;
+            }
+        }
+#endif
+    }
+    rdtscll(e);
+
+    if (id == 0) {
+#ifdef P99_CALC
+        if (n_large < N_LOG-1 && n_large >= N_1P) {
+            qsort(p99, n_large, sizeof(unsigned long), cmpfunc);
+            printf("[%d, (%lu), %d], largest %lu, 99p %lu\n", N_1P, n_large, N_LOG, p99[n_large - 1], p99[n_large - N_1P]);
+        } else {
+            printf("not enough samples for 99percentile... [%d, %d] -> got %lu\n", N_1P, N_LOG, n_large);
+        }
+#endif
+        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu\n", 
+               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update), 
+               tot_cost/(n_read+n_update),  max);
+    } else {
+        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu\n", 
+               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update), 
+               tot_cost/(n_read+n_update),  max);
+    }
+}
+
+void meas_sync_start(void);
+void meas_sync_end(void);
+void thd_set_affinity(pthread_t tid, int cpuid);
+void set_prio(void);
+static void call_getrlimit(int id, char *name)
+{
+	struct rlimit rl;
+
+	if (getrlimit(id, &rl)) {
+		perror("getrlimit: ");
+		exit(-1);
+	}		
+}
+
+static void call_setrlimit(int id, rlim_t c, rlim_t m)
+{
+	struct rlimit rl;
+
+	rl.rlim_cur = c;
+	rl.rlim_max = m;
+	if (setrlimit(id, &rl)) {
+		exit(-1);
+	}		
+}
+
+void set_prio(void)
+{
+	struct sched_param sp;
+
+	call_getrlimit(RLIMIT_CPU, "CPU");
+#ifdef RLIMIT_RTTIME
+	call_getrlimit(RLIMIT_RTTIME, "RTTIME");
+#endif
+	call_getrlimit(RLIMIT_RTPRIO, "RTPRIO");
+	call_setrlimit(RLIMIT_RTPRIO, RLIM_INFINITY, RLIM_INFINITY);
+	call_getrlimit(RLIMIT_RTPRIO, "RTPRIO");	
+	call_getrlimit(RLIMIT_NICE, "NICE");
+
+	if (sched_getparam(0, &sp) < 0) {
+		perror("getparam: ");
+		exit(-1);
+	}
+	sp.sched_priority = sched_get_priority_max(SCHED_RR);
+	if (sched_setscheduler(0, SCHED_RR, &sp) < 0) {
+		perror("setscheduler: ");
+		exit(-1);
+	}
+	if (sched_getparam(0, &sp) < 0) {
+		perror("getparam: ");
+		exit(-1);
+	}
+	assert(sp.sched_priority == sched_get_priority_max(SCHED_RR));
+
+	return;
+}
+
+#define CACHE_ALIGNED __attribute__((aligned(64)))
+
+struct thd_active {
+	int accessed;
+	int done;
+	int avg;
+	int max;
+	int read_avg;
+	int read_max;
+} CACHE_ALIGNED;
+
+struct thd_active thd_active[NUM_CPU] CACHE_ALIGNED;
+volatile int use_ncores;
+
+int cpu_assign[41] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36,
+		      1, 5, 9, 13, 17, 21, 25, 29, 33, 37,
+		      2, 6, 10, 14, 18, 22, 26, 30, 34, 38,
+		      3, 7, 11, 15, 19, 23, 27, 31, 35, 39, -1};
+
+void thd_set_affinity(pthread_t tid, int id)
+{
+	cpu_set_t s;
+	int ret, cpuid;
+
+	cpuid = cpu_assign[id];
+	/* printf("tid %d (%d) to cpu %d\n", tid, id, cpuid); */
+	CPU_ZERO(&s);
+	CPU_SET(cpuid, &s);
+	ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &s);
+	
+	if (ret) {
+		printf("setting affinity error for tid %d on cpu %d\n", (int)tid, cpuid);
+		assert(0);
+	}
+}
+
+void meas_sync_start(void) {
+	int cpu = thd_local_id;
+	ck_pr_store_int(&thd_active[cpu].done, 0);
+	ck_pr_store_int(&thd_active[cpu].avg, 0);
+	ck_pr_store_int(&thd_active[cpu].max, 0);
+	ck_pr_store_int(&thd_active[cpu].read_avg, 0);
+	ck_pr_store_int(&thd_active[cpu].read_max, 0);
+
+    if (use_ncores <= 0)
+        printf("sync_setting error: %d\n", use_ncores);
+
+	if (cpu == 0) {
+		int k = 1;
+		while (k < use_ncores) {
+			while (1) {
+				if (ck_pr_load_int(&thd_active[k].accessed)) break;
+			}
+			k++;
+		}
+		ck_pr_store_int(&thd_active[0].accessed, 1);
+	} else {
+		ck_pr_store_int(&thd_active[cpu].accessed, 1);
+		while (ck_pr_load_int(&thd_active[0].accessed) == 0) ;
+	} // sync!
+}
+
+void meas_sync_end() {
+	int i;
+	int cpu = thd_local_id;
+	ck_pr_store_int(&thd_active[cpu].accessed, 0);
+
+	if (cpu == 0) { // output!!!
+//		printf("test done %d, syncing\n", NUM_CPU_COS);
+		// sync first!
+		for (i = 1; i < use_ncores;i++) {
+			while (1) {
+				if (ck_pr_load_int(&thd_active[i].done)) break;
+			}
+		}
+
+		ck_pr_store_int(&thd_active[0].done, 1);
+	} else {
+		ck_pr_store_int(&thd_active[cpu].done, 1);
+		while (ck_pr_load_int(&thd_active[0].done) == 0) ;
+	}
+}
+
+static void *worker_bench(void *arg) {
+    LIBEVENT_THREAD *me = arg;
+
+    thd_local_id = me->id;
+
+    sleep(1);
+    thd_set_affinity(pthread_self(), thd_local_id);
+    set_prio();
+    meas_sync_start();
+
+    bench();
+    meas_sync_end();
+
+    register_thread_initialized();
+
+    return 0;
+}
 
 /*
  * Initializes the thread subsystem, creating various worker threads.
@@ -797,6 +1204,7 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
         exit(1);
     }
 
+    use_ncores = NUM_CPU;
     item_lock_count = hashsize(power);
     item_lock_hashpower = power;
 
@@ -827,16 +1235,26 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
 
         threads[i].notify_receive_fd = fds[0];
         threads[i].notify_send_fd = fds[1];
+        threads[i].id = i;
 
         setup_thread(&threads[i]);
         /* Reserve three fds for the libevent base, and two for the pipe */
         stats.reserved_fds += 5;
     }
 
-    /* Create threads after we've done all the libevent setup. */
+    printf("MC: loading trace file...\n");
+    preload_keys();
+    load_trace();
+
+    printf("MC: creating %d worker threads\n", nthreads);
     for (i = 0; i < nthreads; i++) {
-        create_worker(worker_libevent, &threads[i]);
+        create_worker(worker_bench, &threads[i]);
     }
+
+    /* Create threads after we've done all the libevent setup. */
+    /* for (i = 0; i < nthreads; i++) { */
+    /*     create_worker(worker_libevent, &threads[i]); */
+    /* } */
 
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);
