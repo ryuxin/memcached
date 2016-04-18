@@ -16,10 +16,7 @@
 #endif
 
 #include <sys/mman.h>
-#include <sched.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-#include <ck_spinlock.h>
+#include "parsec.h"
 
 #define ITEMS_PER_ALLOC 64
 
@@ -63,6 +60,9 @@ static CQ_ITEM *cqi_freelist;
 static pthread_mutex_t cqi_freelist_lock;
 
 static pthread_mutex_t *item_locks;
+
+static ck_spinlock_mcs_t *item_locks_mcs;
+
 /* size of the item lock hash table */
 static uint32_t item_lock_count;
 unsigned int item_lock_hashpower;
@@ -88,6 +88,7 @@ static pthread_cond_t init_cond;
 static void thread_libevent_process(int fd, short which, void *arg);
 
 unsigned short refcount_incr(unsigned short *refcount) {
+    PARSEC_NOT_USED;
 #ifdef HAVE_GCC_ATOMICS
     return __sync_add_and_fetch(refcount, 1);
 #elif defined(__sun)
@@ -102,9 +103,8 @@ unsigned short refcount_incr(unsigned short *refcount) {
 #endif
 }
 
-extern __thread int thd_local_id;
-
 unsigned short refcount_decr(unsigned short *refcount) {
+    PARSEC_NOT_USED;
 #ifdef HAVE_GCC_ATOMICS
     return __sync_sub_and_fetch(refcount, 1);
 #elif defined(__sun)
@@ -119,8 +119,36 @@ unsigned short refcount_decr(unsigned short *refcount) {
 #endif
 }
 
-void item_lock(uint32_t hv) {
-    mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+struct item_mcslock {
+    ck_spinlock_mcs_context_t l;
+    char padding[CACHE_LINE*2 - sizeof(ck_spinlock_mcs_context_t)];
+} __attribute__((aligned(CACHE_LINE)));
+
+/* 1 per thread for fast path lock ops. Allocate additional ones on
+ * stack if holding multiple locks -- e.g. in item_alloc. */
+struct item_mcslock item_mcslock[NUM_CPU] __attribute__((aligned(4096)));
+
+void item_mcs_lock(uint32_t hv) {
+    ck_spinlock_mcs_lock(&item_locks_mcs[hv & hashmask(item_lock_hashpower)], &(item_mcslock[thd_local_id].l));
+}
+
+void item_mcs_unlock(uint32_t hv) {
+    ck_spinlock_mcs_unlock(&item_locks_mcs[hv & hashmask(item_lock_hashpower)], &(item_mcslock[thd_local_id].l));
+}
+
+/* try lock/unlock are not on fast path -- they need to pass in the
+ * mcs lock context (from their stack). */
+void *item_try_mcslock(uint32_t hv, void *lock_context) {
+    ck_spinlock_mcs_t *l = &item_locks_mcs[hv & hashmask(item_lock_hashpower)];
+
+    if (ck_spinlock_mcs_trylock(l, lock_context)) {
+        return l;
+    } 
+    return NULL;
+}
+
+void item_try_mcsunlock(void *lock, void *lock_context) {
+    ck_spinlock_mcs_unlock(lock, lock_context);
 }
 
 /* Special case. When ITEM_LOCK_GLOBAL mode is enabled, this should become a
@@ -140,6 +168,11 @@ void *item_trylock(uint32_t hv) {
 
 void item_trylock_unlock(void *lock) {
     mutex_unlock((pthread_mutex_t *) lock);
+
+}
+
+void item_lock(uint32_t hv) {
+    mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
 }
 
 void item_unlock(uint32_t hv) {
@@ -371,76 +404,86 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     }
 }
 
-static int
-test_get_key(char* key, int nkey)
-{
-    item *it;
-
-    it = item_get(key, nkey);
-    if (it) {
-        item_update(it);
-        /* release the item reference after we are done. */
-        item_remove(it);
-        // shouldn't be accessing it from now on.
-        return 1;
-    }
-
-    return 0;
-}
-
 /* alloc + link / replace. Flattened from the state machine. */
 static int
 set_key(char* key, int nkey, char *data, int nbytes)
 {
     item *old_it, *it;
     uint32_t hv;
-
+    int retry = 1;
+start:
+    lib_enter();
     /* alloc */
     it = item_alloc(key, nkey, 0, 0, nbytes+2);
-    if (unlikely(!it)) {
-        printf("allocation error?\n");
+    if (!it) {
+        printf("ERROR: item_alloc failed once? \n");
+        lib_exit();
+        if (retry) {
+            retry = 0;
+             goto start;
+        }
+        printf("alloc failed\n");
+
+        return -1;
     }
-    assert(it);
     memcpy(ITEM_data(it), data, nbytes);
 
-    /* link / replace */
+    /* link / replace next */
     hv = hash(ITEM_key(it), it->nkey);
+
     /* bucket lock */
-    item_lock(hv);
-    assert(*key == *ITEM_key(it));
+    item_mcs_lock(hv);
+
     old_it = do_item_get(key, it->nkey, hv);
-//    printf("b\n");
 
     if (old_it != NULL) {
         item_replace(old_it, it, hv);
-        do_item_remove(old_it);
     } else {
         do_item_link(it, hv);
     }
     /* unlock */
-    item_unlock(hv);
+    item_mcs_unlock(hv);
 
-    item_remove(it);       /* release the item reference */
+    lib_exit();
 
     return 0;
+}
+
+static int
+test_get_key(char* key, int nkey)
+{
+    item *it;
+
+    lib_enter();
+
+    it = item_get(key, nkey);
+    if (it)
+        item_update(it);
+
+    /* only safe to access before the _exit. We can invoke callback
+     * function here. */
+    lib_exit();
+
+    if (!it) return 0;
+
+    return 1;
 }
 
 /*
  * Worker thread: main event loop
  */
-static void *worker_libevent(void *arg) {
-    LIBEVENT_THREAD *me = arg;
+/* static void *worker_libevent(void *arg) { */
+/*     LIBEVENT_THREAD *me = arg; */
 
-    /* Any per-thread setup can happen here; memcached_thread_init() will block until
-     * all threads have finished initializing.
-     */
+/*     /\* Any per-thread setup can happen here; memcached_thread_init() will block until */
+/*      * all threads have finished initializing. */
+/*      *\/ */
 
-    register_thread_initialized();
+/*     register_thread_initialized(); */
 
-    event_base_loop(me->base, 0);
-    return NULL;
-}
-
+/*     event_base_loop(me->base, 0); */
+/*     return NULL; */
+/* } */
 
 /*
  * Processes an incoming "handle a new connection" item. This is called when
@@ -552,10 +595,12 @@ item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbyt
 item *item_get(const char *key, const size_t nkey) {
     item *it;
     uint32_t hv;
+    
     hv = hash(key, nkey);
-    item_lock(hv);
+//    item_lock(hv);
     it = do_item_get(key, nkey, hv);
-    item_unlock(hv);
+//    item_unlock(hv);
+    
     return it;
 }
 
@@ -620,12 +665,12 @@ void item_unlink(item *item) {
  * Moves an item to the back of the LRU queue.
  */
 void item_update(item *item) {
-    uint32_t hv;
-    hv = hash(ITEM_key(item), item->nkey);
+    /* uint32_t hv; */
+    /* hv = hash(ITEM_key(item), item->nkey); */
 
-    item_lock(hv);
+//    item_lock(hv);
     do_item_update(item);
-    item_unlock(hv);
+//    item_unlock(hv);
 }
 
 /*
@@ -707,10 +752,14 @@ void  item_stats_sizes(ADD_STAT add_stats, void *c) {
 /******************************* GLOBAL STATS ******************************/
 
 void STATS_LOCK() {
+    PARSEC_NOT_USED;
+    return;
     pthread_mutex_lock(&stats_lock);
 }
 
 void STATS_UNLOCK() {
+    PARSEC_NOT_USED;
+    return;
     pthread_mutex_unlock(&stats_lock);
 }
 
@@ -820,6 +869,9 @@ void slab_stats_aggregate(struct thread_stats *stats, struct slab_stats *out) {
         out->cas_badval += stats->slab_stats[sid].cas_badval;
     }
 }
+
+static void *worker_parsec(void *arg);
+
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -841,8 +893,6 @@ char ops[N_OPS][KEY_LENGTH + 1];
 unsigned long p99[N_LOG];
 #endif
 
-static void *worker_bench(void *arg);
-
 int load_trace(void);
 void preload_keys(void);
 
@@ -855,7 +905,6 @@ void preload_keys(void)
     int bytes;
     char *load_file = "../mc_trace/trace_load_key";
 
-    memset(v, 0, V_LENGTH);
     ret = mlock(ops, N_OPS*(KEY_LENGTH + 1));
 	if (ret) {
 		printf("Cannot lock cache memory (%d). Check privilege. Exit.\n", ret);
@@ -915,6 +964,154 @@ int load_trace(void)
     return 0;
 }
 
+/*
+ * Initializes the thread subsystem, creating various worker threads.
+ *
+ * nthreads  Number of worker event handler threads to spawn
+ * main_base Event base for main thread
+ */
+void memcached_thread_init(int nthreads, struct event_base *main_base) {
+    int         i;
+    int         power;
+
+    pthread_mutex_init(&cache_lock, NULL);
+    pthread_mutex_init(&worker_hang_lock, NULL);
+
+    pthread_mutex_init(&init_lock, NULL);
+    pthread_cond_init(&init_cond, NULL);
+
+    pthread_mutex_init(&cqi_freelist_lock, NULL);
+    cqi_freelist = NULL;
+
+    /* Want a wide lock table, but don't waste memory */
+    if (nthreads < 3) {
+        power = 10;
+    } else if (nthreads < 4) {
+        power = 11;
+    } else if (nthreads < 5) {
+        power = 12;
+    } else {
+        /* 8192 buckets, and central locks don't scale much past 5 threads */
+        /* power = 13; */
+        
+        power = 13;
+    }
+
+    if (power >= hashpower) {
+        fprintf(stderr, "Hash table power size (%d) cannot be equal to or less than item lock table (%d)\n", hashpower, power);
+        fprintf(stderr, "Item lock table grows with `-t N` (worker threadcount)\n");
+        fprintf(stderr, "Hash table grows with `-o hashpower=N` \n");
+        exit(1);
+    }
+
+    item_lock_count = hashsize(power);
+    item_lock_hashpower = power;
+
+    item_locks     = calloc(item_lock_count, sizeof(pthread_mutex_t));
+    item_locks_mcs = calloc(item_lock_count, sizeof(ck_spinlock_mcs_t));
+
+    if (!item_locks_mcs) {
+        perror("Can't allocate item locks");
+        exit(1);
+    }
+    for (i = 0; i < item_lock_count; i++) {
+        pthread_mutex_init(&item_locks[i], NULL);
+        item_locks_mcs[i] = CK_SPINLOCK_MCS_INITIALIZER;
+    }
+
+    threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
+    if (! threads) {
+        perror("Can't allocate thread descriptors");
+        exit(1);
+    }
+
+    dispatcher_thread.base = main_base;
+    dispatcher_thread.thread_id = pthread_self();
+
+    for (i = 0; i < nthreads; i++) {
+        int fds[2];
+        if (pipe(fds)) {
+            perror("Can't create notify pipe");
+            exit(1);
+        }
+
+        threads[i].notify_receive_fd = fds[0];
+        threads[i].notify_send_fd = fds[1];
+        threads[i].id = i;
+
+        setup_thread(&threads[i]);
+        /* Reserve three fds for the libevent base, and two for the pipe */
+        stats.reserved_fds += 5;
+    }
+
+    parsec_init();
+
+    printf("MC: loading trace file...\n");
+    preload_keys();
+    load_trace();
+
+    printf("MC: creating %d worker threads\n", nthreads);
+    for (i = 0; i < nthreads; i++) {
+        create_worker(worker_parsec, &threads[i]);
+    }
+
+    /* Wait for all the threads to set themselves up before returning. */
+    pthread_mutex_lock(&init_lock);
+    wait_for_thread_registration(nthreads);
+    pthread_mutex_unlock(&init_lock);
+}
+
+__attribute__ ((unused)) static void 
+test_test(void)
+{
+    int i, j, k, ret;
+    char aaa = 'a';
+    char aa[4];
+    char value[CACHE_LINE];
+
+    printf("thd %d: starting set + get...\n", thd_local_id);
+    memset(value, 0, CACHE_LINE);
+
+    aa[0] = aaa;
+    for (i = 0; i < 5; i++) {
+        aa[1] = i;
+        for (j = 0; j < 128; j++) {
+            aa[2] = j;
+            for (k = 0; k < 128; k++) {
+                aa[3] = k;
+
+//                printf("thd %d, %d %d %d\n", thd_local_id, i,j,k);
+                ret = set_key(aa, 4, value, CACHE_LINE);
+                if (ret) printf("--------------set failed?!\n");
+            }
+        }
+        printf("thd %d, %d\n", thd_local_id, i);
+    }
+
+    printf("and counting ...\n");
+    /* browse cache content */
+    int tot = 0;
+    for (i = 0; i < 128; i++) {
+        aa[1] = i;
+        for (j = 0; j < 128; j++) {
+            aa[2] = j;
+            for (k = 0; k < 128; k++) {
+                /* printf("k %d\n", k); */
+                aa[3] = k;
+                ret = test_get_key(aa, 4);
+                if (ret) {
+                    /* count keys */
+                    tot++;
+                }
+            }
+        }
+    }
+
+    printf("Thd %d: verified tot %d keys in cache\n", thd_local_id, tot);
+
+    return;
+}
+
 #define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A" (val))
 
 #ifdef P99_CALC
@@ -952,6 +1149,7 @@ bench(void)
             n_read++;
 
             ret = test_get_key(key, KEY_LENGTH);
+
             assert(ret);
             if (!ret) {
                 /* If get returns null, do a set. */
@@ -1009,146 +1207,8 @@ bench(void)
     }
 }
 
-void meas_sync_start(void);
-void meas_sync_end(void);
-void thd_set_affinity(pthread_t tid, int cpuid);
-void set_prio(void);
-static void call_getrlimit(int id, char *name)
-{
-	struct rlimit rl;
-
-	if (getrlimit(id, &rl)) {
-		perror("getrlimit: ");
-		exit(-1);
-	}		
-}
-
-static void call_setrlimit(int id, rlim_t c, rlim_t m)
-{
-	struct rlimit rl;
-
-	rl.rlim_cur = c;
-	rl.rlim_max = m;
-	if (setrlimit(id, &rl)) {
-		exit(-1);
-	}		
-}
-
-void set_prio(void)
-{
-	struct sched_param sp;
-
-	call_getrlimit(RLIMIT_CPU, "CPU");
-#ifdef RLIMIT_RTTIME
-	call_getrlimit(RLIMIT_RTTIME, "RTTIME");
-#endif
-	call_getrlimit(RLIMIT_RTPRIO, "RTPRIO");
-	call_setrlimit(RLIMIT_RTPRIO, RLIM_INFINITY, RLIM_INFINITY);
-	call_getrlimit(RLIMIT_RTPRIO, "RTPRIO");	
-	call_getrlimit(RLIMIT_NICE, "NICE");
-
-	if (sched_getparam(0, &sp) < 0) {
-		perror("getparam: ");
-		exit(-1);
-	}
-	sp.sched_priority = sched_get_priority_max(SCHED_RR);
-	if (sched_setscheduler(0, SCHED_RR, &sp) < 0) {
-		perror("setscheduler: ");
-		exit(-1);
-	}
-	if (sched_getparam(0, &sp) < 0) {
-		perror("getparam: ");
-		exit(-1);
-	}
-	assert(sp.sched_priority == sched_get_priority_max(SCHED_RR));
-
-	return;
-}
-
-#define CACHE_ALIGNED __attribute__((aligned(64)))
-
-struct thd_active {
-	int accessed;
-	int done;
-	int avg;
-	int max;
-	int read_avg;
-	int read_max;
-} CACHE_ALIGNED;
-
-struct thd_active thd_active[NUM_CPU] CACHE_ALIGNED;
-volatile int use_ncores;
-
-int cpu_assign[41] = {0, 4, 8, 12, 16, 20, 24, 28, 32, 36,
-		      1, 5, 9, 13, 17, 21, 25, 29, 33, 37,
-		      2, 6, 10, 14, 18, 22, 26, 30, 34, 38,
-		      3, 7, 11, 15, 19, 23, 27, 31, 35, 39, -1};
-
-void thd_set_affinity(pthread_t tid, int id)
-{
-	cpu_set_t s;
-	int ret, cpuid;
-
-	cpuid = cpu_assign[id];
-	/* printf("tid %d (%d) to cpu %d\n", tid, id, cpuid); */
-	CPU_ZERO(&s);
-	CPU_SET(cpuid, &s);
-	ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &s);
-	
-	if (ret) {
-		printf("setting affinity error for tid %d on cpu %d\n", (int)tid, cpuid);
-		assert(0);
-	}
-}
-
-void meas_sync_start(void) {
-	int cpu = thd_local_id;
-	ck_pr_store_int(&thd_active[cpu].done, 0);
-	ck_pr_store_int(&thd_active[cpu].avg, 0);
-	ck_pr_store_int(&thd_active[cpu].max, 0);
-	ck_pr_store_int(&thd_active[cpu].read_avg, 0);
-	ck_pr_store_int(&thd_active[cpu].read_max, 0);
-
-    if (use_ncores <= 0)
-        printf("sync_setting error: %d\n", use_ncores);
-
-	if (cpu == 0) {
-		int k = 1;
-		while (k < use_ncores) {
-			while (1) {
-				if (ck_pr_load_int(&thd_active[k].accessed)) break;
-			}
-			k++;
-		}
-		ck_pr_store_int(&thd_active[0].accessed, 1);
-	} else {
-		ck_pr_store_int(&thd_active[cpu].accessed, 1);
-		while (ck_pr_load_int(&thd_active[0].accessed) == 0) ;
-	} // sync!
-}
-
-void meas_sync_end() {
-	int i;
-	int cpu = thd_local_id;
-	ck_pr_store_int(&thd_active[cpu].accessed, 0);
-
-	if (cpu == 0) { // output!!!
-//		printf("test done %d, syncing\n", NUM_CPU_COS);
-		// sync first!
-		for (i = 1; i < use_ncores;i++) {
-			while (1) {
-				if (ck_pr_load_int(&thd_active[i].done)) break;
-			}
-		}
-
-		ck_pr_store_int(&thd_active[0].done, 1);
-	} else {
-		ck_pr_store_int(&thd_active[cpu].done, 1);
-		while (ck_pr_load_int(&thd_active[0].done) == 0) ;
-	}
-}
-
-static void *worker_bench(void *arg) {
+volatile int done = 0;
+static void *worker_parsec(void *arg) {
     LIBEVENT_THREAD *me = arg;
 
     thd_local_id = me->id;
@@ -1157,108 +1217,15 @@ static void *worker_bench(void *arg) {
     thd_set_affinity(pthread_self(), thd_local_id);
     set_prio();
     meas_sync_start();
-
-    bench();
+//QW
+    if (thd_local_id == 0) {
+        bench();
+    } else {
+        bench();
+    }
     meas_sync_end();
 
     register_thread_initialized();
-
+    
     return 0;
 }
-
-/*
- * Initializes the thread subsystem, creating various worker threads.
- *
- * nthreads  Number of worker event handler threads to spawn
- * main_base Event base for main thread
- */
-void memcached_thread_init(int nthreads, struct event_base *main_base) {
-    int         i;
-    int         power;
-
-    pthread_mutex_init(&cache_lock, NULL);
-    pthread_mutex_init(&worker_hang_lock, NULL);
-
-    pthread_mutex_init(&init_lock, NULL);
-    pthread_cond_init(&init_cond, NULL);
-
-    pthread_mutex_init(&cqi_freelist_lock, NULL);
-    cqi_freelist = NULL;
-
-    /* Want a wide lock table, but don't waste memory */
-    if (nthreads < 3) {
-        power = 10;
-    } else if (nthreads < 4) {
-        power = 11;
-    } else if (nthreads < 5) {
-        power = 12;
-    } else {
-        /* 8192 buckets, and central locks don't scale much past 5 threads */
-        power = 13;
-    }
-
-    if (power >= hashpower) {
-        fprintf(stderr, "Hash table power size (%d) cannot be equal to or less than item lock table (%d)\n", hashpower, power);
-        fprintf(stderr, "Item lock table grows with `-t N` (worker threadcount)\n");
-        fprintf(stderr, "Hash table grows with `-o hashpower=N` \n");
-        exit(1);
-    }
-
-    use_ncores = NUM_CPU;
-    item_lock_count = hashsize(power);
-    item_lock_hashpower = power;
-
-    item_locks = calloc(item_lock_count, sizeof(pthread_mutex_t));
-    if (! item_locks) {
-        perror("Can't allocate item locks");
-        exit(1);
-    }
-    for (i = 0; i < item_lock_count; i++) {
-        pthread_mutex_init(&item_locks[i], NULL);
-    }
-
-    threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
-    if (! threads) {
-        perror("Can't allocate thread descriptors");
-        exit(1);
-    }
-
-    dispatcher_thread.base = main_base;
-    dispatcher_thread.thread_id = pthread_self();
-
-    for (i = 0; i < nthreads; i++) {
-        int fds[2];
-        if (pipe(fds)) {
-            perror("Can't create notify pipe");
-            exit(1);
-        }
-
-        threads[i].notify_receive_fd = fds[0];
-        threads[i].notify_send_fd = fds[1];
-        threads[i].id = i;
-
-        setup_thread(&threads[i]);
-        /* Reserve three fds for the libevent base, and two for the pipe */
-        stats.reserved_fds += 5;
-    }
-
-    printf("MC: loading trace file...\n");
-    preload_keys();
-    load_trace();
-
-    printf("MC: creating %d worker threads\n", nthreads);
-    for (i = 0; i < nthreads; i++) {
-        create_worker(worker_bench, &threads[i]);
-    }
-
-    /* Create threads after we've done all the libevent setup. */
-    /* for (i = 0; i < nthreads; i++) { */
-    /*     create_worker(worker_libevent, &threads[i]); */
-    /* } */
-
-    /* Wait for all the threads to set themselves up before returning. */
-    pthread_mutex_lock(&init_lock);
-    wait_for_thread_registration(nthreads);
-    pthread_mutex_unlock(&init_lock);
-}
-

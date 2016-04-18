@@ -1,5 +1,7 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
+#include "parsec.h"
+
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/signal.h>
@@ -32,8 +34,40 @@ typedef struct {
     uint64_t lrutail_reflocked;
 } itemstats_t;
 
+// clock list lock.
+struct clocks {
+    ck_spinlock_mcs_t l_clock; // = CK_SPINLOCK_MCS_INITIALIZER;
+    item *hand[LARGEST_ID];
+    /* may not need the following */
+    item *heads[LARGEST_ID];
+    item *tails[LARGEST_ID];
+    char padding[2*CACHE_LINE - (sizeof(item*)*LARGEST_ID*3 + sizeof(ck_spinlock_mcs_t)) % CACHE_LINE];
+};
+
+static struct clocks clocks[N_CLOCK] __attribute__((aligned(CACHE_LINE)));
+
+#define hashsize(n) ((unsigned long int)1<<(n))
+#define hashmask(n) (hashsize(n)-1)
+
+#define MCS_CLOCK_LOCK
+
+#ifdef MCS_CLOCK_LOCK
+#define LOCK_CLOCK(hv)  ck_spinlock_mcs_context_t me; 	       \
+                        ck_pr_store_uint(&(me.locked), false); \
+                        ck_pr_store_ptr(&(me.next), NULL);     \
+                        ck_spinlock_mcs_lock(&(clocks[hv & hashmask(N_CLOCK_POWER)].l_clock), &me)
+
+#define UNLOCK_CLOCK(hv)  ck_spinlock_mcs_unlock(&(clocks[hv & hashmask(N_CLOCK_POWER)].l_clock), &me)
+#else
+
+#define LOCK_CLOCK(hv)    mutex_lock(&cache_lock)
+#define UNLOCK_CLOCK(hv)  mutex_unlock(&cache_lock)
+
+#endif
+
 static item *heads[LARGEST_ID];
 static item *tails[LARGEST_ID];
+
 static crawler crawlers[LARGEST_ID];
 static itemstats_t itemstats[LARGEST_ID];
 static unsigned int sizes[LARGEST_ID];
@@ -92,6 +126,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
                     const rel_time_t exptime, const int nbytes,
                     const uint32_t cur_hv) {
     uint8_t nsuffix;
+    ck_spinlock_mcs_context_t second_lock;
     item *it = NULL;
     char suffix[40];
     size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
@@ -103,156 +138,121 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     if (id == 0)
         return 0;
 
-    mutex_lock(&cache_lock);
-    /* do a quick check if we have any expired items in the tail.. */
-    int tries = 5;
     /* Avoid hangs if a slab has nothing but refcounted stuff in it. */
-    int tries_lrutail_reflocked = 1000;
-    int tried_alloc = 0;
-    item *search;
-    item *next_it;
+    /* int tries_lrutail_reflocked = 1000; */
+    item *search, *init, *next_it;
     void *hold_lock = NULL;
-    rel_time_t oldest_live = settings.oldest_live;
+    /* We might have to fill the quie queue first. */
+    int tries = QUIE_QUEUE_LIMIT;
 
-    search = tails[id];
-    /* We walk up *only* for locked items. Never searching for expired.
-     * Waste of CPU for almost all deployments */
-    for (; tries > 0 && search != NULL; tries--, search=next_it) {
-        /* we might relink search mid-loop, so search->prev isn't reliable */
-        next_it = search->prev;
-        if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
-            /* We are a crawler, ignore it. */
-            tries++;
-            continue;
+    while (tries-- > 0) {
+        /* We have no expiration. Try alloc a new one first. */
+
+        /* we are not holding any locks -- waiting is allowed. */
+        it = q_alloc(ntotal, 1);
+        if (it) break;
+
+#ifdef NO_REPLACEMENT
+        printf("ERROR: trying eviction w/o CLOCK!\n");
+        continue;
+#endif
+        /* only take the lock when doing eviction. */
+        LOCK_CLOCK(cur_hv);
+
+        /* printf("trying eviction, size %d\n", sizes[id]); */
+        /* doing CLOCK eviction */
+        search = clocks[cur_hv & hashmask(N_CLOCK_POWER)].hand[id];
+        if (!search) {
+            /* no mem from alloc or replace */
+            UNLOCK_CLOCK(cur_hv);
+            return NULL;
         }
 
-        uint32_t hv = hash(ITEM_key(search), search->nkey);
-        /* Attempt to hash item lock the "search" item. If locked, no
-         * other callers can incr the refcount
-         */
-        /* Don't accidentally grab ourselves, or bail if we can't quicklock */
-        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL)
-            continue;
-        /* Now see if the item is refcount locked */
-        if (refcount_incr(&search->refcount) != 2) {
-            /* Avoid pathological case with ref'ed items in tail */
-            do_item_update_nolock(search);
-            tries_lrutail_reflocked--;
-            tries++;
-            refcount_decr(&search->refcount);
-            itemstats[id].lrutail_reflocked++;
-            /* Old rare bug could cause a refcount leak. We haven't seen
-             * it in years, but we leave this code in to prevent failures
-             * just in case */
-            if (settings.tail_repair_time &&
-                    search->time + settings.tail_repair_time < current_time) {
-                itemstats[id].tailrepairs++;
-                search->refcount = 1;
-                do_item_unlink_nolock(search, hv);
+        init = search;
+        /* scan loop of the clock, which could be potentially
+         * unbounded -- we may want an upper limit for it. */
+        for ( ; search != NULL; search = next_it) {
+            /* we might relink search mid-loop, so search->prev isn't reliable */
+            next_it = search->next;
+            if (unlikely(next_it == init)) next_it = NULL;
+
+            if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
+                /* We are a crawler, ignore it. */
+                continue;
             }
-            if (hold_lock)
-                item_trylock_unlock(hold_lock);
 
-            if (tries_lrutail_reflocked < 1)
-                break;
-
-            continue;
-        }
-
-        /* Expired or flushed -- disabled */
-        if (0) {/* (search->exptime != 0 && search->exptime < current_time) */
-            /* || (search->time <= oldest_live && oldest_live <= current_time)) { */
-            itemstats[id].reclaimed++;
-            if ((search->it_flags & ITEM_FETCHED) == 0) {
-                itemstats[id].expired_unfetched++;
+            if (search->recency) {
+                /* recently accessed. clear bit and continue. */
+                search->recency = 0;
+                continue;
             }
+
+            uint32_t hv = hash(ITEM_key(search), search->nkey);
+            /* Don't accidentally grab ourselves, or bail if we can't quicklock */
+            if (hv == cur_hv || (hold_lock = item_try_mcslock(hv, &second_lock)) == NULL) {
+                continue;
+            }
+
+            /* We decide to evict this item. */
             it = search;
-            slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
+
+            /* This frees the item (and add to the qwq as well). */
+            /* We don't re-use the evicted item immediately -- put it on
+             * quiescence_waiting queue, and get another one from
+             * it. */
             do_item_unlink_nolock(it, hv);
-            /* Initialize the item block: */
-            it->slabs_clsid = 0;
-        } else if ((it = slabs_alloc(ntotal, id)) == NULL) {
-            printf("should not be evicting...\n");
-            tried_alloc = 1;
-            if (settings.evict_to_free == 0) {
-                itemstats[id].outofmemory++;
-            } else {
-                itemstats[id].evicted++;
-                itemstats[id].evicted_time = current_time - search->time;
-                if (search->exptime != 0)
-                    itemstats[id].evicted_nonzero++;
-                if ((search->it_flags & ITEM_FETCHED) == 0) {
-                    itemstats[id].evicted_unfetched++;
-                }
-                it = search;
-                slabs_adjust_mem_requested(it->slabs_clsid, ITEM_ntotal(it), ntotal);
-                do_item_unlink_nolock(it, hv);
-                /* Initialize the item block: */
-                it->slabs_clsid = 0;
 
-                /* If we've just evicted an item, and the automover is set to
-                 * angry bird mode, attempt to rip memory into this slab class.
-                 * TODO: Move valid object detection into a function, and on a
-                 * "successful" memory pull, look behind and see if the next alloc
-                 * would be an eviction. Then kick off the slab mover before the
-                 * eviction happens.
-                 */
-                if (settings.slab_automove == 2)
-                    slabs_reassign(-1, id);
-            }
+            assert(hold_lock);
+            item_try_mcsunlock(hold_lock, &second_lock);
+
+            break;
         }
-
-        refcount_decr(&search->refcount);
-        /* If hash values were equal, we don't grab a second lock */
-        if (hold_lock)
-            item_trylock_unlock(hold_lock);
-        break;
+        /* end of loop*/
+        /* printf("eviction done, size %d\n", sizes[id]); */
+        UNLOCK_CLOCK(cur_hv);
+        /* after eviction, retry alloc */
     }
 
-    if (!tried_alloc && (tries == 0 || search == NULL))
-        it = slabs_alloc(ntotal, id);
+    /* Item initialization can happen outside of the lock; the item's already
+     * been removed from the slab list.
+     */
+    /* No need for refcnt. */
+    /* it->refcount = 1;     /\* the caller will have a reference *\/ */
 
     if (it == NULL) {
+        printf(">>>>>>>>>>>>>>>>>>> WARNING: NO memory allocated after eviction!\n");
         itemstats[id].outofmemory++;
-        mutex_unlock(&cache_lock);
         return NULL;
     }
 
     assert(it->slabs_clsid == 0);
-    assert(it != heads[id]);
 
-    /* Item initialization can happen outside of the lock; the item's already
-     * been removed from the slab LRU.
-     */
-    it->refcount = 1;     /* the caller will have a reference */
-    mutex_unlock(&cache_lock);
     it->next = it->prev = it->h_next = 0;
     it->slabs_clsid = id;
 
-    DEBUG_REFCNT(it, '*');
     it->it_flags = settings.use_cas ? ITEM_CAS : 0;
     it->nkey = nkey;
     it->nbytes = nbytes;
     memcpy(ITEM_key(it), key, nkey);
-    it->exptime = 0; //exptime;
+    it->exptime = 0; //exptime; /* disable expiration. */
     memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
     it->nsuffix = nsuffix;
+
     return it;
 }
 
 void item_free(item *it) {
-    size_t ntotal = ITEM_ntotal(it);
-    unsigned int clsid;
+    /* size_t ntotal = ITEM_ntotal(it); */
     assert((it->it_flags & ITEM_LINKED) == 0);
     assert(it != heads[it->slabs_clsid]);
     assert(it != tails[it->slabs_clsid]);
-    assert(it->refcount == 0);
+    /* assert(it->refcount == 0); */
 
     /* so slab size changer can tell later if item is already free or not */
-    clsid = it->slabs_clsid;
     it->slabs_clsid = 0;
-    DEBUG_REFCNT(it, 'F');
-    slabs_free(it, ntotal, clsid);
+    /* DEBUG_REFCNT(it, 'F'); */
+
+    q_free(it);
 }
 
 /**
@@ -272,7 +272,46 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     return slabs_clsid(ntotal) != 0;
 }
 
-static void item_link_q(item *it) { /* item is the new head */
+/* circular ll w/ virtual hand for CLOCK replacement. */
+static void item_link_clock(item *it, const uint32_t hv) { /* item is the new head */
+    item **head, **tail;
+    int clock_id;
+    struct clocks *clock_list;
+
+    assert(it->slabs_clsid < LARGEST_ID);
+    assert((it->it_flags & ITEM_SLABBED) == 0);
+
+    clock_id = hv & hashmask(N_CLOCK_POWER);
+    clock_list = &clocks[clock_id];
+
+    head = &clock_list->heads[it->slabs_clsid];
+    tail = &clock_list->tails[it->slabs_clsid];
+    assert(it != *head);
+    assert((*head && *tail) || (*head == 0 && *tail == 0));
+
+    it->prev = *tail;
+    it->next = *head;
+
+    if (it->next) {
+        assert(*tail);
+        it->next->prev = it;
+        (*tail)->next = it;
+    } else { /* first item in the list */
+        assert(*tail == 0);
+        it->next = it->prev = it;
+        assert(clock_list->hand[it->slabs_clsid] == 0);
+        clock_list->hand[it->slabs_clsid] = it;
+        *tail = it;
+    }
+
+    *head = it;
+    /* sizes[it->slabs_clsid]++; */
+
+    return;
+}
+
+__attribute__((unused)) static void 
+item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert(it->slabs_clsid < LARGEST_ID);
     assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -281,12 +320,62 @@ static void item_link_q(item *it) { /* item is the new head */
     tail = &tails[it->slabs_clsid];
     assert(it != *head);
     assert((*head && *tail) || (*head == 0 && *tail == 0));
-    it->prev = 0;
+
+    it->prev = *tail;
     it->next = *head;
-    if (it->next) it->next->prev = it;
+
+    if (it->next) {
+        assert(*tail);
+        it->next->prev = it;
+        (*tail)->next = it;
+    } else { /* first item in the list */
+        assert(*tail == 0);
+        it->next = it->prev = it;
+        *tail = it;
+    }
+
     *head = it;
-    if (*tail == 0) *tail = it;
+
     sizes[it->slabs_clsid]++;
+
+    return;
+}
+
+/* Virtual hand is set to it->next after unlink. */
+static void item_unlink_clock(item *it, const uint32_t hv) {
+    item **head, **tail;
+    int clock_id;
+    struct clocks *clock_list;
+
+    assert(it->slabs_clsid < LARGEST_ID);
+    clock_id = hv & hashmask(N_CLOCK_POWER);
+    clock_list = &clocks[clock_id];
+
+    head = &clock_list->heads[it->slabs_clsid];
+    tail = &clock_list->tails[it->slabs_clsid];
+
+    assert(it->next);
+    assert(it->prev);
+
+    if (*head == it) {
+        *head = it->next;
+    }
+    if (*tail == it) {
+        *tail = it->prev;
+    }
+
+    if (it == it->next) {
+        assert(it == it->prev);
+        assert(*head == *tail);
+        *head = *tail = 0;
+        clock_list->hand[it->slabs_clsid] = 0;
+    } else {
+        it->next->prev = it->prev;
+        it->prev->next = it->next;
+        clock_list->hand[it->slabs_clsid] = it->next;
+    }
+
+    /* sizes[it->slabs_clsid]--; */
 
     return;
 }
@@ -297,78 +386,92 @@ static void item_unlink_q(item *it) {
     head = &heads[it->slabs_clsid];
     tail = &tails[it->slabs_clsid];
 
+    assert(it->next);
+    assert(it->prev);
+
     if (*head == it) {
-        assert(it->prev == 0);
         *head = it->next;
     }
     if (*tail == it) {
-        assert(it->next == 0);
         *tail = it->prev;
     }
-    assert(it->next != it);
-    assert(it->prev != it);
 
-    if (it->next) it->next->prev = it->prev;
-    if (it->prev) it->prev->next = it->next;
+    if (it == it->next) {
+        assert(it == it->prev);
+        assert(*head == *tail);
+        *head = *tail = 0;
+    } else {
+        it->next->prev = it->prev;
+        it->prev->next = it->next;
+    }
+
     sizes[it->slabs_clsid]--;
+
     return;
 }
 
 int do_item_link(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
-    mutex_lock(&cache_lock);
+
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
 
-    STATS_LOCK();
-    stats.curr_bytes += ITEM_ntotal(it);
-    stats.curr_items += 1;
-    stats.total_items += 1;
-    STATS_UNLOCK();
-
     /* Allocate a new CAS ID on link. */
-    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+//    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
     assoc_insert(it, hv);
-    item_link_q(it);
-    refcount_incr(&it->refcount);
-    mutex_unlock(&cache_lock);
+
+#ifndef NO_REPLACEMENT
+    LOCK_CLOCK(hv);
+    item_link_clock(it, hv);
+    UNLOCK_CLOCK(hv);
+#endif
 
     return 1;
 }
 
 void do_item_unlink(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
-    mutex_lock(&cache_lock);
-    if ((it->it_flags & ITEM_LINKED) != 0) {
-        it->it_flags &= ~ITEM_LINKED;
-        STATS_LOCK();
-        stats.curr_bytes -= ITEM_ntotal(it);
-        stats.curr_items -= 1;
-        STATS_UNLOCK();
-        assoc_delete(ITEM_key(it), it->nkey, hv);
-        item_unlink_q(it);
-        do_item_remove(it);
-    }
-    mutex_unlock(&cache_lock);
+//    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+    assert(it->it_flags & ITEM_LINKED);
+
+    it->it_flags &= ~ITEM_LINKED;
+    /* STATS_LOCK(); */
+    /* stats.curr_bytes -= ITEM_ntotal(it); */
+    /* stats.curr_items -= 1; */
+    /* STATS_UNLOCK(); */
+    assoc_delete(ITEM_key(it), it->nkey, hv);
+
+    LOCK_CLOCK(hv);
+    item_unlink_clock(it, hv);
+    UNLOCK_CLOCK(hv);
+
+    do_item_remove_free(it);
+}
+
+/* this ignores the refcnt. */
+void do_item_remove_free(item *it) {
+//    MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
+    assert((it->it_flags & ITEM_SLABBED) == 0);
+
+    item_free(it);
 }
 
 /* FIXME: Is it necessary to keep this copy/pasted code? */
 void do_item_unlink_nolock(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
-    if ((it->it_flags & ITEM_LINKED) != 0) {
-        it->it_flags &= ~ITEM_LINKED;
-        STATS_LOCK();
-        stats.curr_bytes -= ITEM_ntotal(it);
-        stats.curr_items -= 1;
-        STATS_UNLOCK();
-        assoc_delete(ITEM_key(it), it->nkey, hv);
-        item_unlink_q(it);
-        do_item_remove(it);
-    }
+//    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+
+    assert(it->it_flags & ITEM_LINKED);
+    it->it_flags &= ~ITEM_LINKED;
+    /* STATS_LOCK(); */
+    /* stats.curr_bytes -= ITEM_ntotal(it); */
+    /* stats.curr_items -= 1; */
+    /* STATS_UNLOCK(); */
+    assoc_delete(ITEM_key(it), it->nkey, hv);
+    item_unlink_q(it);
+    do_item_remove_free(it);
 }
 
 void do_item_remove(item *it) {
+    PARSEC_NOT_USED;
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
     assert(it->refcount > 0);
@@ -381,40 +484,42 @@ void do_item_remove(item *it) {
 /* Copy/paste to avoid adding two extra branches for all common calls, since
  * _nolock is only used in an uncommon case. */
 void do_item_update_nolock(item *it) {
-    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
-    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
-        assert((it->it_flags & ITEM_SLABBED) == 0);
-
-        if ((it->it_flags & ITEM_LINKED) != 0) {
-            item_unlink_q(it);
-            it->time = current_time;
-            item_link_q(it);
-        }
-    }
+#ifdef NO_REPLACEMENT
+    return;
+#else
+    if (it->recency == 0) it->recency = 1;
+#endif
 }
 
 void do_item_update(item *it) {
-    MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
-    if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
-        assert((it->it_flags & ITEM_SLABBED) == 0);
-
-        mutex_lock(&cache_lock);
-        if ((it->it_flags & ITEM_LINKED) != 0) {
-            item_unlink_q(it);
-            it->time = current_time;
-            item_link_q(it);
-        }
-        mutex_unlock(&cache_lock);
-    }
+#ifdef NO_REPLACEMENT
+    return;
+#else
+    if (it->recency == 0) it->recency = 1;
+#endif
 }
 
-int do_item_replace(item *it, item *new_it, const uint32_t hv) {
-    MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
-                           ITEM_key(new_it), new_it->nkey, new_it->nbytes);
-    assert((it->it_flags & ITEM_SLABBED) == 0);
+int do_item_replace(item *old, item *new, const uint32_t hv) {
+    assert(old->it_flags & ITEM_LINKED);
+    old->it_flags &= ~ITEM_LINKED;
+    /* we have the bucket lock. */
+    assoc_delete(ITEM_key(old), old->nkey, hv);
+    
+    assert((new->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+    new->it_flags |= ITEM_LINKED;
+    new->time = current_time;
+    assoc_insert(new, hv);
 
-    do_item_unlink(it, hv);
-    return do_item_link(new_it, hv);
+#ifndef NO_REPLACEMENT
+    /* lock only once */
+    LOCK_CLOCK(hv);
+    item_unlink_clock(old, hv);
+    item_link_clock(new, hv);
+    UNLOCK_CLOCK(hv);
+#endif
+    do_item_remove_free(old);
+
+    return 1;
 }
 
 /*@null@*/
@@ -575,61 +680,49 @@ void do_item_stats_sizes(ADD_STAT add_stats, void *c) {
 
 /** wrapper around assoc_find which does the lazy expiration logic */
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
-    //mutex_lock(&cache_lock);
     item *it = assoc_find(key, nkey, hv);
 
-    if (it != NULL) {
-        refcount_incr(&it->refcount);
-        /* Optimization for slab reassignment. prevents popular items from
-         * jamming in busy wait. Can only do this here to satisfy lock order
-         * of item_lock, cache_lock, slabs_lock. */
-        if (slab_rebalance_signal &&
-            ((void *)it >= slab_rebal.slab_start && (void *)it < slab_rebal.slab_end)) {
-            do_item_unlink(it, hv);
-            do_item_remove(it);
-            it = NULL;
-        }
-    }
-    //mutex_unlock(&cache_lock);
-    int was_found = 0;
+    /* int was_found = 0; */
 
-    if (settings.verbose > 2) {
-        int ii;
-        if (it == NULL) {
-            fprintf(stderr, "> NOT FOUND ");
-        } else {
-            fprintf(stderr, "> FOUND KEY ");
-            was_found++;
-        }
-        for (ii = 0; ii < nkey; ++ii) {
-            fprintf(stderr, "%c", key[ii]);
-        }
-    }
+    /* if (settings.verbose > 2) { */
+    /*     int ii; */
+    /*     if (it == NULL) { */
+    /*         fprintf(stderr, "> NOT FOUND "); */
+    /*     } else { */
+    /*         fprintf(stderr, "> FOUND KEY "); */
+    /*         was_found++; */
+    /*     } */
+    /*     for (ii = 0; ii < nkey; ++ii) { */
+    /*         fprintf(stderr, "%c", key[ii]); */
+    /*     } */
+    /* } */
 
-    if (it != NULL) {
-        if (settings.oldest_live != 0 && settings.oldest_live <= current_time &&
-            it->time <= settings.oldest_live) {
-            do_item_unlink(it, hv);
-            do_item_remove(it);
-            it = NULL;
-            if (was_found) {
-                fprintf(stderr, " -nuked by flush");
-            }
-        } else if (it->exptime != 0 && it->exptime <= current_time) {
-            do_item_unlink(it, hv);
-            do_item_remove(it);
-            it = NULL;
-            if (was_found) {
-                fprintf(stderr, " -nuked by expire");
-            }
-        } else {
-            it->it_flags |= ITEM_FETCHED;
-            DEBUG_REFCNT(it, '+');
-        }
-    }
+    /* if (it != NULL) { */
+    /*     if (settings.oldest_live != 0 && settings.oldest_live <= current_time && */
+    /*         it->time <= settings.oldest_live) { */
+    /*         do_item_unlink(it, hv); */
+    /*         do_item_remove(it); */
+    /*         it = NULL; */
+    /*         if (was_found) { */
+    /*             fprintf(stderr, " -nuked by flush"); */
+    /*         } */
+    /*     } else if (it->exptime != 0 && it->exptime <= current_time) { */
+    /*         do_item_unlink(it, hv); */
+    /*         do_item_remove(it); */
+    /*         it = NULL; */
+    /*         if (was_found) { */
+    /*             fprintf(stderr, " -nuked by expire"); */
+    /*         } */
+    /*     } else { */
+    /*         /\* read is concurrent now -- should not modify the flag as */
+    /*          * there might be writers doing eviction. *\/ */
+    /*         /\* it->it_flags |= ITEM_FETCHED; *\/ */
+    /*         /\* DEBUG_REFCNT(it, '+'); *\/ */
+    /*     } */
+    /* } */
 
-    if (settings.verbose > 2)
-        fprintf(stderr, "\n");
+    /* if (settings.verbose > 2) */
+    /*     fprintf(stderr, "\n"); */
 
     return it;
 }

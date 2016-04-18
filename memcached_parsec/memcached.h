@@ -4,19 +4,30 @@
  * The main memcached header holding commonly used data
  * structures and function prototypes.
  */
+#ifndef MEMCACHED_H
+#define MEMCACHED_H
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
-#define NUM_CPU (40)
-#define TRACE_FILE "../mc_trace/trace20p_key"
+#define NUM_CPU (10)
+// if defined, ignore all clock list ops, including locking
+//#define NO_REPLACEMENT
+
+#define TRACE_FILE "../mc_trace/trace10p_key"
+
+#define N_CLOCK_POWER (6)
+#define N_CLOCK (1 << N_CLOCK_POWER)
 
 // for 99 percentile w/ limited memory
-#define THRES (10000000)
+#define THRES (3000)
 
-#define CACHE_LINE 64
-#define MEM_SIZE (512*1024*1024)
+#define QUIE_QUEUE_LIMIT (256)
+
+#define CACHE_LINE (64)
+
+typedef unsigned long long quie_time_t;
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -31,6 +42,14 @@
 #include "cache.h"
 
 #include "sasl_defs.h"
+
+#include <ck_spinlock.h>
+void item_mcs_lock(uint32_t hv);
+void item_mcs_unlock(uint32_t hv);
+void *item_try_mcslock(uint32_t hv, void *lock_context);
+void item_try_mcsunlock(void *lock, void *lock_context);
+
+#define PARSEC_NOT_USED printf("Warning: should not use this w/ PARSEC!\n")
 
 /** Maximum length of a key. */
 #define KEY_MAX_LENGTH 250
@@ -349,6 +368,9 @@ extern struct settings settings;
 
 #define ITEM_FETCHED 8
 
+// the following disables LRU.
+#define CLOCK_REPLACEMENT
+
 /**
  * Structure for storing items within memcached.
  */
@@ -356,6 +378,9 @@ typedef struct _stritem {
     struct _stritem *next;
     struct _stritem *prev;
     struct _stritem *h_next;    /* hash chain next */
+#ifdef CLOCK_REPLACEMENT
+    uint8_t         recency;   /* QW: recent used bit in CLOCK replacement */
+#endif
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
@@ -535,6 +560,20 @@ enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
 extern int daemonize(int nochdir, int noclose);
 
+/* static inline void clock_lock(ck_spinlock_mcs_context_t *me) */
+/* { */
+/*     ck_spinlock_mcs_lock(&l_clock, me); */
+
+/*     return; */
+/* } */
+
+/* static inline void clock_unlock(ck_spinlock_mcs_context_t *me) */
+/* { */
+/*     ck_spinlock_mcs_lock(&l_clock, me); */
+
+/*     return; */
+/* } */
+
 static inline int mutex_lock(pthread_mutex_t *mutex)
 {
     while (pthread_mutex_trylock(mutex));
@@ -544,12 +583,26 @@ static inline int mutex_lock(pthread_mutex_t *mutex)
 #define mutex_unlock(x) pthread_mutex_unlock(x)
 
 #include "stats.h"
+
 #include "slabs.h"
+#include "parsec.h"
+
 #include "assoc.h"
 #include "items.h"
 #include "trace.h"
 #include "hash.h"
 #include "util.h"
+
+void *q_alloc(size_t size, const int waiting);
+int q_free(void *node);
+void *lib_exec(void *(*func)(void *), void *arg);
+void parsec_init(void);
+
+void spin_delay(unsigned long long cycles);
+void lib_enter(void);
+void lib_exit(void);
+int parsec_quiescence_check(quie_time_t time_check);
+int parsec_quiescence_wait(quie_time_t orig_timestamp);
 
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
@@ -615,5 +668,9 @@ extern void drop_privileges(void);
 #define __builtin_expect(x, expected_value) (x)
 #endif
 
+#ifndef likely
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+#endif
+
+#endif

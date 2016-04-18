@@ -21,6 +21,8 @@
 #include <assert.h>
 #include <pthread.h>
 
+#include "parsec.h"
+
 /* powers-of-N allocation structures */
 
 typedef struct {
@@ -403,6 +405,7 @@ void *slabs_alloc(size_t size, unsigned int id) {
     pthread_mutex_lock(&slabs_lock);
     ret = do_slabs_alloc(size, id);
     pthread_mutex_unlock(&slabs_lock);
+
     return ret;
 }
 

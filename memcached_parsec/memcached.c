@@ -55,8 +55,6 @@
 #endif
 #endif
 
-__thread int thd_local_id;
-
 /*
  * forward declarations
  */
@@ -223,7 +221,7 @@ static void settings_init(void) {
     settings.socketpath = NULL;       /* by default, not using a unix socket */
     settings.factor = 1.25;
     settings.chunk_size = 48;         /* space for a modest key and value */
-    settings.num_threads = 4;         /* N workers */
+    settings.num_threads = -1; // we overwrite this later.          /* N workers */
     settings.num_threads_per_udp = 0;
     settings.prefix_delimiter = ':';
     settings.detail_enabled = 0;
@@ -5412,6 +5410,8 @@ int main (int argc, char **argv) {
         }
     }
 
+    settings.num_threads = NUM_CPU;
+
     if (hash_init(hash_type) != 0) {
         fprintf(stderr, "Failed to initialize hash_algorithm!\n");
         exit(EX_USAGE);
@@ -5426,7 +5426,6 @@ int main (int argc, char **argv) {
     } else {
         settings.num_threads_per_udp = settings.num_threads;
     }
-    settings.num_threads = NUM_CPU;
 
     if (settings.sasl) {
         if (!protocol_specified) {
@@ -5488,8 +5487,11 @@ int main (int argc, char **argv) {
         }
     }
 
+#define PARSEC_LOCKMEM
+    /* We need the privileges to lock memory. */
+#ifndef PARSEC_LOCKMEM
     /* lose root privileges if we have them */
-    if (0) {//getuid() == 0 || geteuid() == 0) {
+    if (getuid() == 0 || geteuid() == 0) {
         if (username == 0 || *username == '\0') {
             fprintf(stderr, "can't run as root without the -u switch\n");
             exit(EX_USAGE);
@@ -5503,6 +5505,9 @@ int main (int argc, char **argv) {
             exit(EX_OSERR);
         }
     }
+#else
+    (void)pw;
+#endif
 
     /* Initialize Sasl if -S was specified */
     if (settings.sasl) {
@@ -5524,7 +5529,7 @@ int main (int argc, char **argv) {
     /* lock paged memory if needed */
     if (lock_memory) {
 #ifdef HAVE_MLOCKALL
-        int res = mlockall(MCL_CURRENT | MCL_FUTURE);
+        int res = mlockall(MCL_CURRENT);// | MCL_FUTURE);
         if (res != 0) {
             fprintf(stderr, "warning: -k invalid, mlockall() failed: %s\n",
                     strerror(errno));
@@ -5536,15 +5541,12 @@ int main (int argc, char **argv) {
 
     /* initialize main thread libevent instance */
     main_base = event_init();
-    settings.maxbytes = MEM_SIZE;
-    settings.oldest_live = 1; /* avoid flushing. */
 
     /* initialize other stuff */
     stats_init();
     assoc_init(settings.hashpower_init);
     conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate);
-
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we
      * need that information
@@ -5554,6 +5556,7 @@ int main (int argc, char **argv) {
         exit(EX_OSERR);
     }
     /* start up worker threads if MT mode */
+
     memcached_thread_init(settings.num_threads, main_base);
 
     printf("MC: exiting...\n");

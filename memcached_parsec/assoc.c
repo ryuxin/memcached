@@ -68,10 +68,10 @@ void assoc_init(const int hashtable_init) {
         fprintf(stderr, "Failed to init hashtable.\n");
         exit(EXIT_FAILURE);
     }
-    STATS_LOCK();
+//    STATS_LOCK();
     stats.hash_power_level = hashpower;
     stats.hash_bytes = hashsize(hashpower) * sizeof(void *);
-    STATS_UNLOCK();
+//    STATS_UNLOCK();
 }
 
 item *assoc_find(const char *key, const size_t nkey, const uint32_t hv) {
@@ -118,6 +118,7 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
     while (*pos && ((nkey != (*pos)->nkey) || memcmp(key, ITEM_key(*pos), nkey))) {
         pos = &(*pos)->h_next;
     }
+
     return pos;
 }
 
@@ -167,25 +168,24 @@ int assoc_insert(item *it, const uint32_t hv) {
         primary_hashtable[hv & hashmask(hashpower)] = it;
     }
 
-    hash_items++;
+//    hash_items++;
     if (! expanding && hash_items > (hashsize(hashpower) * 3) / 2) {
         assoc_start_expand();
     }
 
-    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);
+//    MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey, hash_items);
     return 1;
 }
 
 void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
     item **before = _hashitem_before(key, nkey, hv);
-
     if (*before) {
         item *nxt;
-        hash_items--;
+//        hash_items--;
         /* The DTrace probe cannot be triggered as the last instruction
          * due to possible tail-optimization by the compiler
          */
-        MEMCACHED_ASSOC_DELETE(key, nkey, hash_items);
+//        MEMCACHED_ASSOC_DELETE(key, nkey, hash_items);
         nxt = (*before)->h_next;
         (*before)->h_next = 0;   /* probably pointless, but whatever. */
         *before = nxt;
