@@ -6,6 +6,8 @@
 
 extern __thread int thd_local_id;
 extern struct parsec ps;
+extern unsigned long long set_periods[NUM_CPU];
+extern unsigned long long quiesce_periods[NUM_CPU];
 
 void parsec_mem_init(void);
 void *parsec_mem_alloc(size_t size);

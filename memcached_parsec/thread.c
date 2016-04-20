@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 
 #define ITEMS_PER_ALLOC 64
+#define CPU_FREQ 2000000
 
 /* An item in the connection queue. */
 typedef struct conn_queue_item CQ_ITEM;
@@ -877,6 +878,7 @@ static void *worker_parsec(void *arg);
 
 #define N_OPS 10000000
 #define N_KEYS 1000000
+#define BUFFER_SIZE 100
 
 #define KEY_LENGTH 16
 #define V_LENGTH   (KEY_LENGTH * 2)
@@ -1197,14 +1199,103 @@ bench(void)
             printf("not enough samples for 99percentile... [%d, %d] -> got %lu\n", N_1P, N_LOG, n_large);
         }
 #endif
-        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu\n", 
-               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update), 
-               tot_cost/(n_read+n_update),  max);
+        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
+               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
+               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
     } else {
-        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu\n", 
-               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update), 
-               tot_cost/(n_read+n_update),  max);
+        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
+               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
+               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
     }
+}
+
+static void 
+period_bench(void)
+{
+    int i, ret;
+    unsigned long n_read = 0, n_update = 0;
+#ifdef P99_CALC
+    unsigned long n_large = 0;
+#endif
+    char *op, value[V_LENGTH], key[KEY_LENGTH];
+    int id = thd_local_id, jump = settings.num_threads;
+    unsigned long long s, e, s1, e1, tot_cost = 0, max = 0, cost;
+    char **ring;
+    int head, tail, ntrace;
+    unsigned long long period, cur_time, deadline = 0;
+    
+    head = tail = ntrace = 0;
+    period = set_periods[thd_local_id];
+    ring = (char **)malloc(sizeof(char *)*BUFFER_SIZE);
+    for(i=0; i<BUFFER_SIZE; i++) ring[i] = (char *)malloc(KEY_LENGTH);
+
+    /* prepare the value -- no real database op needed. */
+    memset(value, 1, V_LENGTH);
+
+    rdtscll(s);
+    while (ntrace < N_OPS) {
+        assert((tail+1)%BUFFER_SIZE != head);
+        
+        rdtsc(cur_time);
+        /* reach a deadline, send set request if have any*/
+        if (cur_time >= deadline && head != tail) {
+            deadline += period;
+            n_update++;
+            rdtscll(s1);
+            ret = set_key(ring[head], KEY_LENGTH, value, V_LENGTH);
+            head = (head+1)%BUFFER_SIZE;
+            rdtscll(e1);
+        } else {
+            op = ops[ntrace];
+            ntrace += jump
+            if (*op == 'R') {
+                memcpy(key, &op[1], KEY_LENGTH);
+                n_read++;
+                rdtscll(s1);
+                ret = test_get_key(key, KEY_LENGTH);
+                rdtscll(e1);
+            }
+            if (!ret || *op == 'U') {
+                memcpy(ring[tail], &op[1], KEY_LENGTH);
+                tail = (tail+1)%BUFFER_SIZE;
+                s1 = e1 = 0;
+            }
+        }
+        
+        cost = e1-s1;
+        tot_cost += cost;
+        if (cost > max) max = cost;
+#ifdef P99_CALC
+        if (id == 0 && cost > THRES) {
+            p99[n_large] = cost;
+            if (n_large < N_LOG - 1) {
+                n_large++;
+            }
+        }
+#endif
+    }
+    rdtscll(e);
+
+    if (id == 0) {
+#ifdef P99_CALC
+        if (n_large < N_LOG-1 && n_large >= N_1P) {
+            qsort(p99, n_large, sizeof(unsigned long), cmpfunc);
+            printf("[%d, (%lu), %d], largest %lu, 99p %lu\n", N_1P, n_large, N_LOG, p99[n_large - 1], p99[n_large - N_1P]);
+        } else {
+            printf("not enough samples for 99percentile... [%d, %d] -> got %lu\n", N_1P, N_LOG, n_large);
+        }
+#endif
+        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
+               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
+               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
+    } else {
+        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
+               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
+               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
+    }
+    
+    for(i=0; i<BUFFER_SIZE; i++) free(ring[i]);
+    free(ring);
 }
 
 volatile int done = 0;
@@ -1224,7 +1315,16 @@ static void *worker_parsec(void *arg) {
         bench();
     }
     meas_barrier(NUM_CPU);
-
+    printf("============begin real time test==============\n");
+    meas_barrier(NUM_CPU);
+//QW
+    if (thd_local_id == 0) {
+        period_bench();
+    } else {
+        period_bench();
+    }
+    meas_barrier(NUM_CPU);
+    
     register_thread_initialized();
     
     return 0;
