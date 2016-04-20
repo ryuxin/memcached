@@ -1,6 +1,5 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
-#include "parsec.h"
 
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -149,7 +148,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         /* We have no expiration. Try alloc a new one first. */
 
         /* we are not holding any locks -- waiting is allowed. */
-        it = q_alloc(ntotal, 1);
+        it = parsec_mem_alloc(ntotal);
         if (it) break;
 
 #ifdef NO_REPLACEMENT
@@ -252,7 +251,7 @@ void item_free(item *it) {
     it->slabs_clsid = 0;
     /* DEBUG_REFCNT(it, 'F'); */
 
-    q_free(it);
+    parsec_mem_free(it);
 }
 
 /**

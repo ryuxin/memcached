@@ -593,17 +593,6 @@ static inline int mutex_lock(pthread_mutex_t *mutex)
 #include "hash.h"
 #include "util.h"
 
-void *q_alloc(size_t size, const int waiting);
-int q_free(void *node);
-void *lib_exec(void *(*func)(void *), void *arg);
-void parsec_init(void);
-
-void spin_delay(unsigned long long cycles);
-void lib_enter(void);
-void lib_exit(void);
-int parsec_quiescence_check(quie_time_t time_check);
-int parsec_quiescence_wait(quie_time_t orig_timestamp);
-
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
  * communication in multithreaded mode (rather than actually doing the work

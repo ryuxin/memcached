@@ -16,7 +16,6 @@
 #endif
 
 #include <sys/mman.h>
-#include "parsec.h"
 
 #define ITEMS_PER_ALLOC 64
 
@@ -412,12 +411,12 @@ set_key(char* key, int nkey, char *data, int nbytes)
     uint32_t hv;
     int retry = 1;
 start:
-    lib_enter();
+    ps_enter(&ps);
     /* alloc */
     it = item_alloc(key, nkey, 0, 0, nbytes+2);
     if (!it) {
         printf("ERROR: item_alloc failed once? \n");
-        lib_exit();
+        ps_exit(&ps);
         if (retry) {
             retry = 0;
              goto start;
@@ -444,7 +443,7 @@ start:
     /* unlock */
     item_mcs_unlock(hv);
 
-    lib_exit();
+    ps_exit(&ps);
 
     return 0;
 }
@@ -454,7 +453,7 @@ test_get_key(char* key, int nkey)
 {
     item *it;
 
-    lib_enter();
+    ps_enter(&ps);
 
     it = item_get(key, nkey);
     if (it)
@@ -462,7 +461,7 @@ test_get_key(char* key, int nkey)
 
     /* only safe to access before the _exit. We can invoke callback
      * function here. */
-    lib_exit();
+    ps_exit(&ps);
 
     if (!it) return 0;
 
@@ -1044,7 +1043,8 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
         stats.reserved_fds += 5;
     }
 
-    parsec_init();
+    ps_init(&ps);
+    parsec_mem_init();
 
     printf("MC: loading trace file...\n");
     preload_keys();
@@ -1216,14 +1216,14 @@ static void *worker_parsec(void *arg) {
     sleep(1);
     thd_set_affinity(pthread_self(), thd_local_id);
     set_prio();
-    meas_sync_start();
+    meas_barrier(NUM_CPU);
 //QW
     if (thd_local_id == 0) {
         bench();
     } else {
         bench();
     }
-    meas_sync_end();
+    meas_barrier(NUM_CPU);
 
     register_thread_initialized();
     
