@@ -142,16 +142,16 @@ NROFF = nroff
 MANS = $(man_MANS)
 am__tagged_files = $(HEADERS) $(SOURCES) $(TAGS_FILES) $(LISP)
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
-ACLOCAL = ${SHELL} /home/interwq/research/memcached-1.4.22/missing aclocal-1.14
+ACLOCAL = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing aclocal-1.14
 AMTAR = $${TAR-tar}
 AM_DEFAULT_VERBOSITY = 1
-AUTOCONF = ${SHELL} /home/interwq/research/memcached-1.4.22/missing autoconf
-AUTOHEADER = ${SHELL} /home/interwq/research/memcached-1.4.22/missing autoheader
-AUTOMAKE = ${SHELL} /home/interwq/research/memcached-1.4.22/missing automake-1.14
+AUTOCONF = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing autoconf
+AUTOHEADER = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing autoheader
+AUTOMAKE = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing automake-1.14
 AWK = gawk
 CC = gcc -std=gnu99
 CCDEPMODE = depmode=gcc3
-CFLAGS = -g -O2 -pthread -pthread -Wall -Werror -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls -fno-strict-aliasing
+CFLAGS = -g -O2 -pthread -pthread -Wall -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls
 CPP = gcc -E
 CPPFLAGS = 
 CYGPATH_W = echo
@@ -173,9 +173,9 @@ INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LDFLAGS = 
 LIBOBJS = 
-LIBS = -levent -lrt 
+LIBS = -levent 
 LTLIBOBJS = 
-MAKEINFO = ${SHELL} /home/interwq/research/memcached-1.4.22/missing makeinfo
+MAKEINFO = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing makeinfo
 MKDIR_P = /bin/mkdir -p
 OBJEXT = o
 PACKAGE = memcached
@@ -194,11 +194,11 @@ SHELL = /bin/bash
 STRIP = 
 VERSION = 1.4.22
 XML2RFC = no
-XSLTPROC = /usr/bin/xsltproc
-abs_builddir = /home/interwq/research/memcached-1.4.22/doc
-abs_srcdir = /home/interwq/research/memcached-1.4.22/doc
-abs_top_builddir = /home/interwq/research/memcached-1.4.22
-abs_top_srcdir = /home/interwq/research/memcached-1.4.22
+XSLTPROC = no
+abs_builddir = /home/ryx/research/memcached/memcached_parsec/doc
+abs_srcdir = /home/ryx/research/memcached/memcached_parsec/doc
+abs_top_builddir = /home/ryx/research/memcached/memcached_parsec
+abs_top_srcdir = /home/ryx/research/memcached/memcached_parsec
 ac_ct_CC = gcc
 am__include = include
 am__leading_dot = .
@@ -225,7 +225,7 @@ host_vendor = pc
 htmldir = ${docdir}
 includedir = ${prefix}/include
 infodir = ${datarootdir}/info
-install_sh = ${SHELL} /home/interwq/research/memcached-1.4.22/install-sh
+install_sh = ${SHELL} /home/ryx/research/memcached/memcached_parsec/install-sh
 libdir = ${exec_prefix}/lib
 libexecdir = ${exec_prefix}/libexec
 localedir = ${datarootdir}/locale
@@ -234,7 +234,7 @@ mandir = ${datarootdir}/man
 mkdir_p = $(MKDIR_P)
 oldincludedir = /usr/include
 pdfdir = ${docdir}
-prefix = /home/interwq/research/m
+prefix = /usr/local
 program_transform_name = s,x,x,
 psdir = ${docdir}
 sbindir = ${exec_prefix}/sbin
@@ -492,16 +492,16 @@ uninstall-man: uninstall-man1
 
 
 protocol-binary.txt: $(.TARGET:R).full
-	no -c /home/interwq/research/memcached-1.4.22/doc $(.TARGET:R).full $@
+	no -c /home/ryx/research/memcached/memcached_parsec/doc $(.TARGET:R).full $@
 
 protocol-binary-range.txt: $(.TARGET:R).full
-	no -c /home/interwq/research/memcached-1.4.22/doc $(.TARGET:R).full $@
+	no -c /home/ryx/research/memcached/memcached_parsec/doc $(.TARGET:R).full $@
 
 protocol-binary.full: $(.TARGET:R).xml xml2rfc/rfc2629-noinc.xsl
-	/usr/bin/xsltproc --nonet xml2rfc/rfc2629-noinc.xsl $(.TARGET:R).xml > $@
+	no --nonet xml2rfc/rfc2629-noinc.xsl $(.TARGET:R).xml > $@
 
 protocol-binary-range.full: $(.TARGET:R).xml xml2rfc/rfc2629-noinc.xsl
-	/usr/bin/xsltproc --nonet xml2rfc/rfc2629-noinc.xsl $(.TARGET:R).xml > $@
+	no --nonet xml2rfc/rfc2629-noinc.xsl $(.TARGET:R).xml > $@
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.

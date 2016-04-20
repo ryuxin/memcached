@@ -49,4 +49,13 @@ _preinstall
 
 # Debug files
 *.dSYM/
+
+# memcached
+*.Po
 *.gcno
+**/autom4te.cache/**
+memcached
+memcached-debug
+sizes
+testapp
+timedrun
