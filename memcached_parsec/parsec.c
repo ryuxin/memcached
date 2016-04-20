@@ -1,6 +1,6 @@
 #include "parsec.h"
 
-#define ITEM_SIZE 100
+#define ITEM_SIZE 102
 
 __thread int thd_local_id;
 unsigned long long set_periods[NUM_CPU] = {2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000};
