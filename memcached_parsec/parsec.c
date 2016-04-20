@@ -3,8 +3,8 @@
 #define ITEM_SIZE 102
 
 __thread int thd_local_id;
-unsigned long long set_periods[NUM_CPU] = {2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000};
-unsigned long long quiesce_periods[NUM_CPU];
+unsigned long long set_periods[PS_NUMCORES] = {2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000};
+unsigned long long quiesce_periods[PS_NUMCORES];
 struct parsec ps;
 PS_PARSLAB_CREATE(item, ITEM_SIZE, PS_PAGE_SIZE * 128)
 

@@ -5410,7 +5410,7 @@ int main (int argc, char **argv) {
         }
     }
 
-    settings.num_threads = NUM_CPU;
+    settings.num_threads = PS_NUMCORES;
 
     if (hash_init(hash_type) != 0) {
         fprintf(stderr, "Failed to initialize hash_algorithm!\n");

@@ -126,7 +126,7 @@ struct item_mcslock {
 
 /* 1 per thread for fast path lock ops. Allocate additional ones on
  * stack if holding multiple locks -- e.g. in item_alloc. */
-struct item_mcslock item_mcslock[NUM_CPU] __attribute__((aligned(4096)));
+struct item_mcslock item_mcslock[PS_NUMCORES] __attribute__((aligned(4096)));
 
 void item_mcs_lock(uint32_t hv) {
     ck_spinlock_mcs_lock(&item_locks_mcs[hv & hashmask(item_lock_hashpower)], &(item_mcslock[thd_local_id].l));
@@ -890,7 +890,7 @@ char ops[N_OPS][KEY_LENGTH + 1];
 #ifdef P99_CALC
 // 99 percentile
 #define N_LOG (N_OPS / 25) //4M * 4 = 16 MB
-#define N_1P  (N_OPS / 100 / NUM_CPU)
+#define N_1P  (N_OPS / 100 / PS_NUMCORES)
 unsigned long p99[N_LOG];
 #endif
 
@@ -1212,7 +1212,6 @@ bench(void)
 static void 
 period_bench(void)
 {
-    int i, ret;
     unsigned long n_read = 0, n_update = 0;
 #ifdef P99_CALC
     unsigned long n_large = 0;
@@ -1221,9 +1220,10 @@ period_bench(void)
     int id = thd_local_id, jump = settings.num_threads;
     unsigned long long s, e, s1, e1, tot_cost = 0, max = 0, cost;
     char **ring;
-    int head, tail, ntrace;
+    int i, ret = 0, head, tail, ntrace;
     unsigned long long period, cur_time, deadline = 0;
     
+    e1 = 0;
     head = tail = ntrace = 0;
     period = set_periods[thd_local_id];
     ring = (char **)malloc(sizeof(char *)*BUFFER_SIZE);
@@ -1236,7 +1236,7 @@ period_bench(void)
     while (ntrace < N_OPS) {
         assert((tail+1)%BUFFER_SIZE != head);
         
-        rdtsc(cur_time);
+        rdtscll(cur_time);
         /* reach a deadline, send set request if have any*/
         if (cur_time >= deadline && head != tail) {
             deadline += period;
@@ -1247,7 +1247,7 @@ period_bench(void)
             rdtscll(e1);
         } else {
             op = ops[ntrace];
-            ntrace += jump
+            ntrace += jump;
             if (*op == 'R') {
                 memcpy(key, &op[1], KEY_LENGTH);
                 n_read++;
@@ -1307,23 +1307,23 @@ static void *worker_parsec(void *arg) {
     sleep(1);
     thd_set_affinity(pthread_self(), thd_local_id);
     set_prio();
-    meas_barrier(NUM_CPU);
+    meas_barrier(PS_NUMCORES);
 //QW
     if (thd_local_id == 0) {
         bench();
     } else {
         bench();
     }
-    meas_barrier(NUM_CPU);
+    meas_barrier(PS_NUMCORES);
     printf("============begin real time test==============\n");
-    meas_barrier(NUM_CPU);
+    meas_barrier(PS_NUMCORES);
 //QW
     if (thd_local_id == 0) {
         period_bench();
     } else {
         period_bench();
     }
-    meas_barrier(NUM_CPU);
+    meas_barrier(PS_NUMCORES);
     
     register_thread_initialized();
     

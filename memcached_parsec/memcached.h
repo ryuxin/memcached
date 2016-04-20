@@ -11,7 +11,6 @@
 #include "config.h"
 #endif
 
-#define NUM_CPU (10)
 // if defined, ignore all clock list ops, including locking
 //#define NO_REPLACEMENT
 
