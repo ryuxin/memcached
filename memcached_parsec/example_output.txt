@@ -1,0 +1,46 @@
+max 36 tot_max 1200 cur 653
+Thd 5: tot 256411 ops (r 244041, u 12370) done, 3051 (2742) cycles per op, max 11692273, time(ms) 351 left 1, thput 729223 r_avg 2364 w_avg 10210
+Thd 20: tot 256410 ops (r 243975, u 12435) done, 3045 (2730) cycles per op, max 11711274, time(ms) 350 left 1, thput 732362 r_avg 2315 w_avg 10872
+Thd 8: tot 256410 ops (r 243946, u 12464) done, 3053 (2747) cycles per op, max 11904378, time(ms) 352 left 2, thput 728060 r_avg 2353 w_avg 10456
+Thd 9: tot 256411 ops (r 244068, u 12343) done, 3039 (2733) cycles per op, max 6749115, time(ms) 350 left 1, thput 731543 r_avg 2362 w_avg 10084
+Thd 27: tot 256410 ops (r 243879, u 12531) done, 3052 (2739) cycles per op, max 11956700, time(ms) 351 left 1, thput 730093 r_avg 2307 w_avg 11136
+Thd 4: tot 256411 ops (r 244081, u 12330) done, 3021 (2712) cycles per op, max 143697, time(ms) 347 left 1, thput 737225 r_avg 2384 w_avg 9209
+Thd 17: tot 256410 ops (r 243725, u 12685) done, 3051 (2737) cycles per op, max 11537481, time(ms) 350 left 1, thput 730674 r_avg 2296 w_avg 11199
+Thd 6: tot 256411 ops (r 244012, u 12399) done, 3030 (2724) cycles per op, max 7379529, time(ms) 349 left 1, thput 734183 r_avg 2345 w_avg 10169
+Thd 2: tot 256411 ops (r 243857, u 12554) done, 3053 (2744) cycles per op, max 11931261, time(ms) 351 left 1, thput 728732 r_avg 2328 w_avg 10821
+Thd 3: tot 256411 ops (r 243792, u 12619) done, 3053 (2743) cycles per op, max 11475107, time(ms) 351 left 1, thput 728875 r_avg 2352 w_avg 10306
+Thd 15: tot 256410 ops (r 244041, u 12369) done, 3041 (2725) cycles per op, max 11631169, time(ms) 349 left 1, thput 733705 r_avg 2331 w_avg 10512
+Thd 18: tot 256410 ops (r 244008, u 12402) done, 3046 (2733) cycles per op, max 10371097, time(ms) 350 left 1, thput 731747 r_avg 2331 w_avg 10628
+Thd 13: tot 256410 ops (r 243856, u 12554) done, 3046 (2731) cycles per op, max 11602717, time(ms) 350 left 1, thput 732172 r_avg 2338 w_avg 10365
+Thd 11: tot 256410 ops (r 244036, u 12374) done, 3036 (2722) cycles per op, max 7451240, time(ms) 349 left 1, thput 734654 r_avg 2345 w_avg 10148
+Thd 35: tot 256410 ops (r 244004, u 12406) done, 3047 (2733) cycles per op, max 11730300, time(ms) 350 left 1, thput 731717 r_avg 2340 w_avg 10452
+Thd 25: tot 256410 ops (r 243907, u 12503) done, 3045 (2732) cycles per op, max 11224792, time(ms) 350 left 1, thput 731805 r_avg 2329 w_avg 10594
+Thd 26: tot 256410 ops (r 244056, u 12354) done, 3038 (2719) cycles per op, max 166344, time(ms) 348 left 1, thput 735504 r_avg 2382 w_avg 9379
+Thd 30: tot 256410 ops (r 243927, u 12483) done, 3045 (2730) cycles per op, max 12365948, time(ms) 350 left 1, thput 732588 r_avg 2322 w_avg 10702
+Thd 10: tot 256410 ops (r 243890, u 12520) done, 3027 (2714) cycles per op, max 8174403, time(ms) 348 left 1, thput 736664 r_avg 2322 w_avg 10355
+Thd 34: tot 256410 ops (r 244001, u 12409) done, 3051 (2737) cycles per op, max 7465011, time(ms) 350 left 1, thput 730545 r_avg 2339 w_avg 10566
+Thd 22: tot 256410 ops (r 243912, u 12498) done, 3039 (2725) cycles per op, max 11890671, time(ms) 349 left 1, thput 733732 r_avg 2318 w_avg 10668
+Thd 28: tot 256410 ops (r 243973, u 12437) done, 3039 (2724) cycles per op, max 7303785, time(ms) 349 left 1, thput 733974 r_avg 2349 w_avg 10080
+Thd 33: tot 256409 ops (r 243979, u 12430) done, 3042 (2727) cycles per op, max 11391937, time(ms) 349 left 2, thput 733362 r_avg 2337 w_avg 10375
+Thd 32: tot 256410 ops (r 243958, u 12452) done, 3044 (2724) cycles per op, max 11752077, time(ms) 349 left 1, thput 734105 r_avg 2333 w_avg 10377
+Thd 38: tot 256410 ops (r 243843, u 12567) done, 3025 (2710) cycles per op, max 7954693, time(ms) 347 left 1, thput 737964 r_avg 2329 w_avg 10101
+Thd 36: tot 256410 ops (r 243885, u 12525) done, 3049 (2733) cycles per op, max 5449778, time(ms) 350 left 1, thput 731662 r_avg 2364 w_avg 9910
+Thd 37: tot 256410 ops (r 244014, u 12396) done, 3041 (2723) cycles per op, max 179220, time(ms) 349 left 1, thput 734472 r_avg 2389 w_avg 9288
+Thd 21: tot 256410 ops (r 244105, u 12305) done, 3048 (2733) cycles per op, max 11638791, time(ms) 350 left 1, thput 731679 r_avg 2352 w_avg 10285
+Thd 31: tot 256410 ops (r 244053, u 12357) done, 3008 (2689) cycles per op, max 5031491, time(ms) 344 left 1, thput 743511 r_avg 2319 w_avg 10001
+Thd 24: tot 256410 ops (r 244144, u 12266) done, 3037 (2722) cycles per op, max 8375089, time(ms) 349 left 1, thput 734565 r_avg 2329 w_avg 10551
+Thd 12: tot 256410 ops (r 243866, u 12544) done, 3050 (2734) cycles per op, max 7546560, time(ms) 350 left 1, thput 731346 r_avg 2359 w_avg 10037
+Thd 19: tot 256410 ops (r 244132, u 12278) done, 3036 (2723) cycles per op, max 7316624, time(ms) 349 left 1, thput 734267 r_avg 2328 w_avg 10575
+Thd 29: tot 256410 ops (r 244005, u 12405) done, 3043 (2728) cycles per op, max 160744, time(ms) 349 left 1, thput 733122 r_avg 2387 w_avg 9424
+Thd 16: tot 256410 ops (r 243966, u 12444) done, 3052 (2738) cycles per op, max 11603797, time(ms) 351 left 1, thput 730376 r_avg 2322 w_avg 10895
+Thd 23: tot 256410 ops (r 244103, u 12307) done, 3052 (2736) cycles per op, max 8066231, time(ms) 350 left 1, thput 730978 r_avg 2356 w_avg 10267
+Thd 14: tot 256410 ops (r 244015, u 12395) done, 3042 (2728) cycles per op, max 7186545, time(ms) 349 left 1, thput 732994 r_avg 2353 w_avg 10108
+Thd 7: tot 256411 ops (r 244033, u 12378) done, 3037 (2731) cycles per op, max 12049989, time(ms) 350 left 1, thput 732207 r_avg 2336 w_avg 10514
+Thd 0: tot 256411 ops (r 244144, u 12267) done, 3753 (3513) cycles per op, max 99931965, time(ms) 450 left 1, thput 569313 r_avg 1920 w_avg 35214
+r 243992 w 12421 tot 256409 n1p 2564 log 256410
+read max 617010 99p 9189 99.9p 14946 99.99p 33828
+update max 11904098 99p 49956 99.9p 133317 99.99p 182130
+tot max 11904098 99p 12009 99.9p 26658 99.99p 109716
+Thd 1: tot 256413 ops (r 243992, u 12421) done, 3070 (2765) cycles per op, max 11904098, time(ms) 354 left 1, thput 723125 r_avg 2374 w_avg 10456
+max 38 tot_max 1265 cur 413
+

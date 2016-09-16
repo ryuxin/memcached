@@ -12,9 +12,9 @@
 #endif
 
 // if defined, ignore all clock list ops, including locking
-//#define NO_REPLACEMENT
+/* #define NO_REPLACEMENT */
 
-#define TRACE_FILE "../mc_trace/trace10p_key"
+#define TRACE_FILE "../mc_trace/trace20p_u_key"
 
 #define N_CLOCK_POWER (6)
 #define N_CLOCK (1 << N_CLOCK_POWER)

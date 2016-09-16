@@ -13,5 +13,7 @@ void parsec_mem_init(void);
 void *parsec_mem_alloc(size_t size);
 void parsec_mem_free(void *node);
 void parsec_quiesce(void);
+void parsec_init_thd(unsigned long long p);
+void parsec_mem_state(void);
 
 #endif

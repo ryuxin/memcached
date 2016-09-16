@@ -150,6 +150,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         /* we are not holding any locks -- waiting is allowed. */
         it = parsec_mem_alloc(ntotal);
         if (it) break;
+        else printf("item alloc error\n");
 
 #ifdef NO_REPLACEMENT
         printf("ERROR: trying eviction w/o CLOCK!\n");

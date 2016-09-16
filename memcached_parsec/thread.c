@@ -19,6 +19,9 @@
 
 #define ITEMS_PER_ALLOC 64
 #define CPU_FREQ 2000000
+#define SET_PERIOD 1 
+#define MR_PERIOD (1*SET_PERIOD)
+#define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A" (val))
 
 /* An item in the connection queue. */
 typedef struct conn_queue_item CQ_ITEM;
@@ -412,12 +415,12 @@ set_key(char* key, int nkey, char *data, int nbytes)
     uint32_t hv;
     int retry = 1;
 start:
-    ps_enter(&ps);
+    /* ps_enter(&ps); */
     /* alloc */
     it = item_alloc(key, nkey, 0, 0, nbytes+2);
     if (!it) {
         printf("ERROR: item_alloc failed once? \n");
-        ps_exit(&ps);
+        /* ps_exit(&ps); */
         if (retry) {
             retry = 0;
              goto start;
@@ -444,7 +447,8 @@ start:
     /* unlock */
     item_mcs_unlock(hv);
 
-    ps_exit(&ps);
+    /* ps_exit(&ps); */
+    parsec_quiesce();
 
     return 0;
 }
@@ -878,7 +882,7 @@ static void *worker_parsec(void *arg);
 
 #define N_OPS 10000000
 #define N_KEYS 1000000
-#define BUFFER_SIZE 100
+#define BUFFER_SIZE 30000
 
 #define KEY_LENGTH 16
 #define V_LENGTH   (KEY_LENGTH * 2)
@@ -889,9 +893,11 @@ char ops[N_OPS][KEY_LENGTH + 1];
 
 #ifdef P99_CALC
 // 99 percentile
-#define N_LOG (N_OPS / 25) //4M * 4 = 16 MB
+#define N_LOG (N_OPS / PS_NUMCORES) //4M * 4 = 16 MB
 #define N_1P  (N_OPS / 100 / PS_NUMCORES)
 unsigned long p99[N_LOG];
+unsigned long p99_r[N_LOG];
+unsigned long p99_w[N_LOG];
 #endif
 
 int load_trace(void);
@@ -963,6 +969,14 @@ int load_trace(void)
     close(fd);
 
     return 0;
+}
+
+void set_smp_affinity()
+{
+	char cmd[64];
+	/* everything done is the python script. */
+	sprintf(cmd, "python set_smp_affinity.py %d %d", 40, getpid());
+	system(cmd);
 }
 
 /*
@@ -1045,9 +1059,20 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
         stats.reserved_fds += 5;
     }
 
+    set_smp_affinity();
     ps_init(&ps);
     parsec_mem_init();
+#ifdef OPTIMAL
+    printf("optimal parsec\n");
+#endif
 
+#ifdef GENERAL
+    printf("general parsec\n");
+#endif
+
+#ifdef REAL_TIME
+    printf("real time parsec\n");
+#endif
     printf("MC: loading trace file...\n");
     preload_keys();
     load_trace();
@@ -1114,60 +1139,63 @@ test_test(void)
     return;
 }
 
-#define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A" (val))
-
 #ifdef P99_CALC
 //#define AVG   (800)
 //#define THRES (2*AVG)
 static int cmpfunc(const void * a, const void * b)
 {
-    return ( *(int*)a - *(int*)b );
+    return ( *(int*)b - *(int*)a );
 }
 #endif
+
+void Divide(int n, int m, int k, int *s, int *e)
+{
+    int r = n%m, t = n/m;
+    if (k<r) {
+        t++;
+        *s = k*t;
+        *e = *s+t;
+    } else {
+        *s = r*(t+1);
+        *s = *s+(k-r)*t;
+        *e = *s+t;
+    }
+}
 
 static void 
 bench(void)
 {
     int i, ret;
-    unsigned long n_read = 0, n_update = 0;
+    unsigned long n_read = 0, n_update = 0, n_tot;
 #ifdef P99_CALC
     unsigned long n_large = 0;
 #endif
     char *op, value[V_LENGTH], key[KEY_LENGTH];
-    int id = thd_local_id, jump = settings.num_threads;
-    unsigned long long s, e, s1, e1, tot_cost = 0, max = 0, cost;
+    int id = thd_local_id, jump = settings.num_threads, start, end;
+    unsigned long long s, e, s1, e1, tot_r = 0, tot_w = 0, max = 0, tot_cost = 0, cost;
 
     /* prepare the value -- no real database op needed. */
     memset(value, 1, V_LENGTH);
+    Divide(N_OPS, PS_NUMCORES, id, &start, &end);
 
     rdtscll(s);
+
+    /* for (i = start; i < end; i++) { */
     for (i = id; i < N_OPS; i += jump) {
         op = ops[i];
         memcpy(key, &op[1], KEY_LENGTH);
-//        key = &op[1];
 
         rdtscll(s1);        
         if (*op == 'R') {
             n_read++;
 
             ret = test_get_key(key, KEY_LENGTH);
-
-            assert(ret);
             if (!ret) {
                 /* If get returns null, do a set. */
                 n_update++;
                 ret = set_key(key, KEY_LENGTH, value, V_LENGTH);
                 assert(ret == 0);
             }
-            /* char *v = ITEM_data(it); */
-            /* if (it) { */
-            /*     for (j = 0; j < V_LENGTH; j++) { */
-            /*         if (v[j] != op[1 + j % KEY_LENGTH]) { */
-            /*             printf(" %d: %d, %d \n", j, v[j], op[1 + (j % KEY_LENGTH)]); */
-            /*         } */
-            /*         assert(v[j] == op[1 + j % KEY_LENGTH]); */
-            /*     } */
-            /* } */
         } else {
             assert(*op == 'U');
             n_update++;
@@ -1177,42 +1205,45 @@ bench(void)
         }
         rdtscll(e1);
         cost = e1-s1;
+        if (*op == 'R') tot_r += cost;
+        else tot_w += cost;
         tot_cost += cost;
         if (cost > max) max = cost;
 #ifdef P99_CALC
-        if (id == 0 && cost > THRES) {
+        if (id == 0 /* && cost > THRES */) {
             p99[n_large] = cost;
             if (n_large < N_LOG - 1) {
                 n_large++;
             }
+            if (*op == 'R') p99_r[n_read-1] = cost;
+            else p99_w[n_update-1] = cost;
         }
 #endif
     }
     rdtscll(e);
 
-    if (id == 0) {
-#ifdef P99_CALC
-        if (n_large < N_LOG-1 && n_large >= N_1P) {
-            qsort(p99, n_large, sizeof(unsigned long), cmpfunc);
-            printf("[%d, (%lu), %d], largest %lu, 99p %lu\n", N_1P, n_large, N_LOG, p99[n_large - 1], p99[n_large - N_1P]);
-        } else {
-            printf("not enough samples for 99percentile... [%d, %d] -> got %lu\n", N_1P, N_LOG, n_large);
-        }
-#endif
-        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
-               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
-               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
-    } else {
-        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
-               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
-               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
-    }
+/* #ifdef P99_CALC */
+/*     if (id == 1) { */
+/*         qsort(p99, n_large, sizeof(unsigned long), cmpfunc); */
+/*         qsort(p99_r, n_read, sizeof(unsigned long), cmpfunc); */
+/*         qsort(p99_w, n_update, sizeof(unsigned long), cmpfunc); */
+/*         printf("r %d w %d tot %d n1p %d log %d\n", n_read, n_update, n_large, N_1P, N_LOG); */
+/*         printf("read max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99_r[0], p99_r[n_read/100], p99_r[n_read/1000], p99_r[n_read/10000]); */
+/*         printf("update max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99_w[0], p99_w[n_update/100], p99_w[n_update/1000], p99_w[n_update/10000]); */
+/*         printf("tot max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99[0], p99[n_large/100], p99[n_large/1000], p99[n_large/10000]); */
+/*     } */
+/* #endif */
+/*     n_tot = n_read+n_update; */
+/*     printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu r avg %llu w avg %llu\n", */
+/*            (int)thd_local_id, n_tot, n_read, n_update, (unsigned long long)(e-s)/n_tot, */
+/*            tot_cost/n_tot,  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * n_tot * 1000 / tot_cost, */
+/*            tot_r/n_read, tot_w/n_update); */
 }
 
 static void 
 period_bench(void)
 {
-    unsigned long n_read = 0, n_update = 0;
+    unsigned long n_read = 0, n_update = 0, n_tot;
 #ifdef P99_CALC
     unsigned long n_large = 0;
 #endif
@@ -1220,81 +1251,101 @@ period_bench(void)
     int id = thd_local_id, jump = settings.num_threads;
     unsigned long long s, e, s1, e1, tot_cost = 0, max = 0, cost;
     char **ring;
-    int i, ret = 0, head, tail, ntrace;
-    unsigned long long period, cur_time, deadline = 0;
+    int i, ret = 0, head, tail, ntrace, end, left;
+    unsigned long long period, cur_time, deadline = 0, tot_r = 0, tot_w = 0;
+    int fail_cnt = 0, read = 0;
     
     e1 = 0;
-    head = tail = ntrace = 0;
-    period = set_periods[thd_local_id];
+    head   = tail = 0;
+    ntrace = thd_local_id;
+    /* period = set_periods[thd_local_id]; */
+    period = SET_PERIOD;
     ring = (char **)malloc(sizeof(char *)*BUFFER_SIZE);
-    for(i=0; i<BUFFER_SIZE; i++) ring[i] = (char *)malloc(KEY_LENGTH);
+    /* for(i=0; i<BUFFER_SIZE; i++) ring[i] = (char *)malloc(KEY_LENGTH); */
 
     /* prepare the value -- no real database op needed. */
     memset(value, 1, V_LENGTH);
+    Divide(N_OPS, PS_NUMCORES, id, &ntrace, &end);
+    ntrace = id;
+    end = N_OPS;
 
     rdtscll(s);
-    while (ntrace < N_OPS) {
-        assert((tail+1)%BUFFER_SIZE != head);
-        
+    while (ntrace < end) {
+        if ((tail+1)%BUFFER_SIZE == head) printf("thd %d buffer full head %d tail %d\n", id, head, tail);
+        /* ps_mem_fence(); */        
         rdtscll(cur_time);
+        /* if (id ==0) printf("%llu %llu\n", cur_time, deadline); */
+
         /* reach a deadline, send set request if have any*/
-        if (cur_time >= deadline && head != tail) {
-            deadline += period;
+        if (cur_time+100 >= deadline && head != tail) {
+            deadline = cur_time + period;
             n_update++;
+            read = 0;
             rdtscll(s1);
             ret = set_key(ring[head], KEY_LENGTH, value, V_LENGTH);
-            head = (head+1)%BUFFER_SIZE;
             rdtscll(e1);
+            head = (head+1)%BUFFER_SIZE;
+            tot_w += (e1-s1);
         } else {
             op = ops[ntrace];
-            ntrace += jump;
             if (*op == 'R') {
-                memcpy(key, &op[1], KEY_LENGTH);
+                /* memcpy(key, &op[1], KEY_LENGTH); */
+                read = 1;
                 n_read++;
                 rdtscll(s1);
-                ret = test_get_key(key, KEY_LENGTH);
+                /* ret = test_get_key(key, KEY_LENGTH); */
+                ret = test_get_key(&op[1], KEY_LENGTH);
                 rdtscll(e1);
+                tot_r += (e1-s1);
             }
             if (!ret || *op == 'U') {
-                memcpy(ring[tail], &op[1], KEY_LENGTH);
+                /* memcpy(ring[tail], &op[1], KEY_LENGTH); */
+                ring[tail] = &op[1];
                 tail = (tail+1)%BUFFER_SIZE;
-                s1 = e1 = 0;
+                if (*op == 'U') {
+                    s1 = e1 = 0;
+                    read = -1;
+                } else fail_cnt++;
             }
+            ntrace += jump;
         }
         
         cost = e1-s1;
-        tot_cost += cost;
+        tot_cost += cost; 
         if (cost > max) max = cost;
 #ifdef P99_CALC
-        if (id == 0 && cost > THRES) {
+        if (id == 1 && cost) {
             p99[n_large] = cost;
             if (n_large < N_LOG - 1) {
                 n_large++;
             }
+            if (read == 1) p99_r[n_read-1] = cost;
+            if (read == 0) p99_w[n_update-1] = cost;
         }
 #endif
     }
     rdtscll(e);
 
-    if (id == 0) {
 #ifdef P99_CALC
-        if (n_large < N_LOG-1 && n_large >= N_1P) {
-            qsort(p99, n_large, sizeof(unsigned long), cmpfunc);
-            printf("[%d, (%lu), %d], largest %lu, 99p %lu\n", N_1P, n_large, N_LOG, p99[n_large - 1], p99[n_large - N_1P]);
-        } else {
-            printf("not enough samples for 99percentile... [%d, %d] -> got %lu\n", N_1P, N_LOG, n_large);
-        }
-#endif
-        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
-               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
-               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
-    } else {
-        printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu\n",
-               (int)thd_local_id, n_read+n_update, n_read, n_update, (unsigned long long)(e-s)/(n_read + n_update),
-               tot_cost/(n_read+n_update),  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * N_OPS * 1000 / tot_cost);
+    if (id == 1) {
+        qsort(p99, n_large, sizeof(unsigned long), cmpfunc);
+        qsort(p99_r, n_read, sizeof(unsigned long), cmpfunc);
+        qsort(p99_w, n_update, sizeof(unsigned long), cmpfunc);
+        printf("r %lu w %lu tot %lu n1p %d log %d\n", n_read, n_update, n_large, N_1P, N_LOG);
+        printf("read max %lu 99p %lu 99.9p %lu 99.99p %lu\n", 10*p99_r[0], p99_r[n_read/100], p99_r[n_read/1000], p99_r[n_read/10000]);
+        printf("update max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99_w[0], p99_w[n_update/100], p99_w[n_update/1000], p99_w[n_update/10000]);
+        printf("tot max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99[0], p99[n_large/100], p99[n_large/1000], p99[n_large/10000]);
     }
+#endif
+    if (tail >= head) left = tail-head+1;
+    else left = tail+BUFFER_SIZE-head;
+    n_tot = n_read+n_update;
+    printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu left %d, thput %llu r_avg %llu w_avg %llu\n",
+           (int)thd_local_id, n_tot, n_read, n_update, (unsigned long long)(e-s)/n_tot,
+           tot_cost/n_tot,  max, tot_cost/(unsigned long long)CPU_FREQ,  
+           left, (unsigned long long)CPU_FREQ *n_tot * 1000 / tot_cost, tot_r/n_read, tot_w/n_update);
     
-    for(i=0; i<BUFFER_SIZE; i++) free(ring[i]);
+    /* for(i=0; i<BUFFER_SIZE; i++) free(ring[i]); */
     free(ring);
 }
 
@@ -1306,24 +1357,26 @@ static void *worker_parsec(void *arg) {
 
     sleep(1);
     thd_set_affinity(pthread_self(), thd_local_id);
-    set_prio();
-    meas_barrier(PS_NUMCORES);
-//QW
+    sleep(1);
+    parsec_init_thd(MR_PERIOD);
+    /* meas_barrier(PS_NUMCORES); */
+    bench();
+
     if (thd_local_id == 0) {
-        bench();
-    } else {
-        bench();
+        parsec_mem_state();
+        memset(p99, 0, sizeof(p99));
+        memset(p99_r, 0, sizeof(p99_r));
+        memset(p99_w, 0, sizeof(p99_w));
     }
+    sleep(3);
     meas_barrier(PS_NUMCORES);
-    printf("============begin real time test==============\n");
+
+        /* bench(); */
+    period_bench();
+    sleep(2);
     meas_barrier(PS_NUMCORES);
-//QW
-    if (thd_local_id == 0) {
-        period_bench();
-    } else {
-        period_bench();
-    }
-    meas_barrier(PS_NUMCORES);
+    if (thd_local_id == 0) parsec_mem_state();
+
     
     register_thread_initialized();
     

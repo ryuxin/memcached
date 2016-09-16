@@ -187,7 +187,7 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
          */
 //        MEMCACHED_ASSOC_DELETE(key, nkey, hash_items);
         nxt = (*before)->h_next;
-        (*before)->h_next = 0;   /* probably pointless, but whatever. */
+        /* (*before)->h_next = 0;   /\* probably pointless, but whatever. *\/ */
         *before = nxt;
         return;
     }
