@@ -8,3 +8,5 @@ int start_assoc_maintenance_thread(void);
 void stop_assoc_maintenance_thread(void);
 extern unsigned int hashpower;
 extern unsigned int item_lock_hashpower;
+
+item *assoc_rcu_replace(const char *key, const size_t nkey, const uint32_t hv, item *it);

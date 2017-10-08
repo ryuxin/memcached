@@ -35,21 +35,8 @@ typedef struct {
 
 ck_spinlock_mcs_t l_clock = CK_SPINLOCK_MCS_INITIALIZER;
 
-#define MCS_LOCK
-#ifdef MCS_LOCK
-
-#define LOCK_CLOCK()  ck_spinlock_mcs_context_t me; 	       \
-                        ck_pr_store_uint(&(me.locked), false); \
-                        ck_pr_store_ptr(&(me.next), NULL);     \
-                        ck_spinlock_mcs_lock(&l_clock, &me)
-
-#define UNLOCK_CLOCK()  ck_spinlock_mcs_unlock(&l_clock, &me)
-#else
-
-#define LOCK_CLOCK()  mutex_lock(&cache_lock);
-#define UNLOCK_CLOCK()  mutex_unlock(&cache_lock);
-
-#endif
+#define LOCK_CLOCK()
+#define UNLOCK_CLOCK()
 
 /* Used for the CLOCK replacement. */
 static item *hand[LARGEST_ID];
@@ -136,6 +123,8 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
 
     /* We have no expiration. Try alloc a new one first. */
     if ((it = slabs_alloc(ntotal, id)) == NULL) {
+        printf("item slab alloc fails\n");
+        assert(0);
         /* doing CLOCK eviction */
         search = hand[id];
         if (!search) {
@@ -342,25 +331,34 @@ static void item_unlink_q(item *it) {
 }
 
 int do_item_link(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
+    /* MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes); */
+    /* assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0); */
+    /* printf("item link 1\n"); */
+    /* LOCK_CLOCK(); */
+    /* it->it_flags |= ITEM_LINKED; */
+    /* it->time = current_time; */
+    /* printf("item link 2\n"); */
+
+    /* STATS_LOCK(); */
+    /* printf("item link 3\n"); */
+    /* stats.curr_bytes += ITEM_ntotal(it); */
+    /* stats.curr_items += 1; */
+    /* stats.total_items += 1; */
+    /* STATS_UNLOCK(); */
+
+    /* /\* Allocate a new CAS ID on link. *\/ */
+    /* ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0); */
+    /* assoc_insert(it, hv); */
+    /* item_link_q(it); */
+    /* refcount_incr(&it->refcount); */
+
+    /* UNLOCK_CLOCK(); */
+
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
-    LOCK_CLOCK();
+
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
-
-    STATS_LOCK();
-    stats.curr_bytes += ITEM_ntotal(it);
-    stats.curr_items += 1;
-    stats.total_items += 1;
-    STATS_UNLOCK();
-
-    /* Allocate a new CAS ID on link. */
-    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
     assoc_insert(it, hv);
-    item_link_q(it);
-    refcount_incr(&it->refcount);
-
-    UNLOCK_CLOCK();
 
     return 1;
 }

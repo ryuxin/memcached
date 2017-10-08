@@ -428,6 +428,7 @@ set_key(char* key, int nkey, char *data, int nbytes)
 /*
  * Worker thread: main event loop
  */
+#if 0
 static void *worker_libevent(void *arg) {
     LIBEVENT_THREAD *me = arg;
 
@@ -440,7 +441,7 @@ static void *worker_libevent(void *arg) {
     event_base_loop(me->base, 0);
     return NULL;
 }
-
+#endif
 
 /*
  * Processes an incoming "handle a new connection" item. This is called when

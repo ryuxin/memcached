@@ -55,8 +55,6 @@
 #endif
 #endif
 
-__thread int thd_local_id;
-
 /*
  * forward declarations
  */

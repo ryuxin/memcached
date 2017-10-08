@@ -241,6 +241,51 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     return it;
 }
 
+item *do_item_init(char *key, const size_t nkey, const int flags,
+                    const rel_time_t exptime, const int nbytes,
+                    const uint32_t cur_hv, item *it) {
+    uint8_t nsuffix;
+    ck_spinlock_mcs_context_t second_lock;
+    char suffix[40];
+    size_t ntotal = item_make_header(nkey + 1, flags, nbytes, suffix, &nsuffix);
+    if (settings.use_cas) {
+        ntotal += sizeof(uint64_t);
+    }
+
+    unsigned int id = slabs_clsid(ntotal);
+    if (id == 0)
+        return 0;
+
+    /* Avoid hangs if a slab has nothing but refcounted stuff in it. */
+    /* int tries_lrutail_reflocked = 1000; */
+    item *search, *init, *next_it;
+    void *hold_lock = NULL;
+    /* We might have to fill the quie queue first. */
+    int tries = QUIE_QUEUE_LIMIT;
+
+
+    if (it == NULL) {
+        printf(">>>>>>>>>>>>>>>>>>> WARNING: NO memory allocated after eviction!\n");
+        itemstats[id].outofmemory++;
+        return NULL;
+    }
+
+    assert(it->slabs_clsid == 0);
+
+    it->next = it->prev = it->h_next = 0;
+    it->slabs_clsid = id;
+
+    it->it_flags = settings.use_cas ? ITEM_CAS : 0;
+    it->nkey = nkey;
+    it->nbytes = nbytes;
+    memcpy(ITEM_key(it), key, nkey);
+    it->exptime = 0; //exptime; /* disable expiration. */
+    memcpy(ITEM_suffix(it), suffix, (size_t)nsuffix);
+    it->nsuffix = nsuffix;
+
+    return it;
+}
+
 void item_free(item *it) {
     /* size_t ntotal = ITEM_ntotal(it); */
     assert((it->it_flags & ITEM_LINKED) == 0);
@@ -1074,4 +1119,20 @@ int init_lru_crawler(void) {
         lru_crawler_initialized = 1;
     }
     return 0;
+}
+
+item *do_item_rcu_replace(const char *key, const size_t nkey, const uint32_t hv, item *it) 
+{
+    item *old = assoc_rcu_replace(key, nkey, hv, it);
+
+    if (old) {
+        assert(old->it_flags & ITEM_LINKED);
+        old->it_flags &= ~ITEM_LINKED;
+        assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+        it->it_flags |= ITEM_LINKED;
+        it->time = current_time;
+        do_item_remove_free(old);
+    }
+
+    return old;
 }

@@ -39,3 +39,6 @@ int init_lru_crawler(void);
 enum crawler_result_type lru_crawler_crawl(char *slabs);
 void lru_crawler_pause(void);
 void lru_crawler_resume(void);
+
+item *do_item_rcu_replace(const char *key, const size_t nkey, const uint32_t hv, item *it);
+item *do_item_init(char *key, const size_t nkey, const int flags, const rel_time_t exptime, const int nbytes, const uint32_t cur_hv, item *it);

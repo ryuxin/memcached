@@ -9,7 +9,7 @@
 #include "config.h"
 #endif
 
-#define NUM_CPU (40)
+#define NUM_CPU (1)
 #define TRACE_FILE "../mc_trace/trace20p_key"
 
 // for 99 percentile w/ limited memory

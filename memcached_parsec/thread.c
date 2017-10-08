@@ -19,9 +19,45 @@
 
 #define ITEMS_PER_ALLOC 64
 #define CPU_FREQ 2000000
-#define SET_PERIOD 1 
+/* #define SET_PERIOD 168000 */
+#define SET_PERIOD 1
 #define MR_PERIOD (1*SET_PERIOD)
 #define rdtscll(val) __asm__ __volatile__("rdtsc" : "=A" (val))
+//#define WCET
+//#define WCET_SAME_KEY
+#define SLACK_TIME
+#define PRINT_THD 11
+
+#define N_OPS 10000000
+#define N_KEYS 1000000
+#define KEY_LENGTH 16
+#define V_LENGTH   (KEY_LENGTH * 2)
+
+char ops[N_OPS][KEY_LENGTH + 1];
+static unsigned long long rp, wp;
+
+static int cmpfunc(const void * a, const void * b)
+{
+	unsigned long aa, bb;
+	aa = *(unsigned long*)a;
+	bb = *(unsigned long*)b;
+	if (bb>aa) return 1;
+	if (bb<aa) return -1;
+	return 0;
+}
+
+static void out_latency(unsigned long *re, int num, char *label)
+{
+	int i;
+	unsigned long long sum = 0;
+
+    if (!re) return ;
+	for(i=0; i<num; i++) sum += (unsigned long long)re[i];
+	qsort(re, num, sizeof(unsigned long), cmpfunc);
+	printf("%s thd %d tot %d avg %llu 99.9 %lu 99 %lu min %lu max %lu\n", label, thd_local_id, 
+           num, sum/num, re[num/1000], re[num/100], re[num-1], re[0]);
+	/* printf("#### %lu\n", re[num/100]); */
+}
 
 /* An item in the connection queue. */
 typedef struct conn_queue_item CQ_ITEM;
@@ -328,7 +364,6 @@ static CQ_ITEM *cqi_new(void) {
     return item;
 }
 
-
 /*
  * Frees a connection queue item (adds it to the freelist.)
  */
@@ -338,7 +373,6 @@ static void cqi_free(CQ_ITEM *item) {
     cqi_freelist = item;
     pthread_mutex_unlock(&cqi_freelist_lock);
 }
-
 
 /*
  * Creates a worker thread.
@@ -407,71 +441,254 @@ static void setup_thread(LIBEVENT_THREAD *me) {
     }
 }
 
+#ifdef WCET
+static item *
+test_get_key(char* key, int nkey, int *lock_cost)
+{
+    item *it;
+    uint32_t hv;
+    unsigned long long s, e, s1, e1;
+
+    hv = hash(key, nkey);
+    rdtscll(s);
+    ps_enter(&ps);
+    rdtscll(s1);
+    it = do_item_get(key, nkey, hv);
+    rdtscll(e1);
+    /* only safe to access before the _exit. We can invoke callback
+     * function here. */
+    ps_exit(&ps);
+    rdtscll(e);
+    *lock_cost = (int)(e - s) - (int)(e1 - s1);
+    return (item *)(int)(e1 - s1);
+}
+
+/* __thread int slab_malloc; */
+/* __thread int slab_aloc_num; */
+/* __thread unsigned long long dtot; */
+static int
+set_key(char* key, int nkey, char *data, int nbytes, int *lock_cost)
+{
+    item *old_it, *it;
+    uint32_t hv;
+    unsigned long long s, e, s1, e1;
+
+    it = item_alloc(key, nkey, 0, 0, nbytes+2);
+    memcpy(ITEM_data(it), data, nbytes);
+    hv = hash(ITEM_key(it), it->nkey);
+
+    /* bucket lock */
+    s = ps_tsc();
+    item_mcs_lock(hv);
+
+    s1 = ps_tsc();
+    old_it = do_item_rcu_replace(key, it->nkey, hv, it);
+    if (old_it == NULL) do_item_link(it, hv);
+    e1 = ps_tsc();
+
+    /* unlock */
+    item_mcs_unlock(hv);
+    parsec_quiesce();
+    e = ps_tsc();
+    *lock_cost = (int)(e - s) - (int)(e1 - s1);
+    return (int)(e1 - s1);
+}
+
+static void
+bench(int *r_buf, int rn, int *w_buf, int wn)
+{
+    int i, ri, wi, ret, id = thd_local_id;
+    unsigned long n_read = 0, n_update = 0, n_cost;
+    char *op, value[V_LENGTH], key[KEY_LENGTH];
+    unsigned long long s, e, s1, e1;
+    unsigned long long curr_t;
+    unsigned long *r_cost = NULL, *w_cost = NULL;
+    unsigned long *r_sect = NULL, *w_sect = NULL;
+    int lock_cost = 0, jump = PS_NUMCORES;
+
+    /* prepare the value -- no real database op needed. */
+    memset(value, 1, V_LENGTH);
+    n_cost = N_OPS;
+    item *tit = parsec_mem_alloc(102);
+    /* slab_malloc = 0; */
+    /* slab_aloc_num = 0; */
+    /* dtot = 0; */
+    if (id == PRINT_THD) {
+        r_cost = calloc(n_cost, sizeof(unsigned long long));
+        w_cost = calloc(n_cost, sizeof(unsigned long long));
+        assert(r_cost && w_cost);
+        memset(r_cost, 0, sizeof(r_cost));
+        memset(w_cost, 0, sizeof(w_cost));
+        r_sect = calloc(n_cost, sizeof(unsigned long long));
+        w_sect = calloc(n_cost, sizeof(unsigned long long));
+        assert(r_sect && w_sect);
+        memset(r_sect, 0, sizeof(r_sect));
+        memset(w_sect, 0, sizeof(w_sect));
+    }
+    ri = wi = 0;
+    meas_barrier(PS_NUMCORES);
+
+    rdtscll(s);
+    for (i = id; i < N_OPS; i += jump) {
+        op = ops[i];
+        if (*op == 'R') {
+#ifdef WCET_SAME_KEY
+            op = ops[1];
+#endif
+            rdtscll(s1);
+            memcpy(key, &op[1], KEY_LENGTH);
+            lock_cost = 0;
+            ret = (int)test_get_key(key, KEY_LENGTH, &lock_cost);
+            rdtscll(e1);
+            if (id == PRINT_THD && n_read < n_cost) {
+                r_sect[n_read] = (unsigned long)ret;
+                r_cost[n_read] = (unsigned long)(e1 - s1) - lock_cost;
+                /* printf("read tot %llu lock %d sect %lu\n", e1-s1, lock_cost, ret); */
+            }
+            n_read++;
+        } else {
+            rdtscll(s1);
+            assert(*op == 'U');
+#ifdef WCET_SAME_KEY
+            op = ops[1];
+#endif
+            memcpy(key, &op[1], KEY_LENGTH);
+            lock_cost = 0;
+            ret = set_key(key, KEY_LENGTH, value, V_LENGTH, &lock_cost);
+            rdtscll(e1);
+            if (id == PRINT_THD && n_update < n_cost) {
+                w_sect[n_update] = /* lock_cost; */(unsigned long)ret;
+                w_cost[n_update] = (unsigned long)(e1 - s1) - lock_cost;
+                /* printf("write tot %llu lock %d sect %lu\n", e1-s1, lock_cost, ret); */
+            }
+            n_update++;
+        }
+    }
+    rdtscll(e);
+    /* printf("sab malloc %d num %d avg %llu\n", slab_malloc, slab_aloc_num, dtot/(unsigned long long)slab_aloc_num); */
+    /* if (id == 0) { */
+    printf("Thd %d: tot %lu ops (r %lu, u %lu) time %llu %llu cycles per op, thput %llu\n", (int)thd_local_id, n_read+n_update, n_read, n_update,
+           (e-s)/(unsigned long long)CPU_FREQ, (unsigned long long)(e-s)/(n_read + n_update), (unsigned long long)CPU_FREQ * (n_read+n_update) * 1000 / (e - s));
+    if (id == PRINT_THD) {
+        out_latency(r_cost, n_read <= n_cost? n_read: n_cost, "get request");
+        out_latency(w_cost, n_update <= n_cost? n_update: n_cost, "set request");
+        free(r_cost);
+        free(w_cost);
+        out_latency(r_sect, n_read <= n_cost? n_read: n_cost, "get request critil sectoin");
+        out_latency(w_sect, n_update <= n_cost? n_update: n_cost, "set request critil sectoin");
+        free(r_sect);
+        free(w_sect);
+    }
+}
+#else
 /* alloc + link / replace. Flattened from the state machine. */
 static int
 set_key(char* key, int nkey, char *data, int nbytes)
 {
     item *old_it, *it;
     uint32_t hv;
-    int retry = 1;
-start:
-    /* ps_enter(&ps); */
-    /* alloc */
+    int r = 0;
+
     it = item_alloc(key, nkey, 0, 0, nbytes+2);
-    if (!it) {
-        printf("ERROR: item_alloc failed once? \n");
-        /* ps_exit(&ps); */
-        if (retry) {
-            retry = 0;
-             goto start;
-        }
-        printf("alloc failed\n");
-
-        return -1;
-    }
+    assert(it);
     memcpy(ITEM_data(it), data, nbytes);
-
-    /* link / replace next */
     hv = hash(ITEM_key(it), it->nkey);
 
     /* bucket lock */
     item_mcs_lock(hv);
-
-    old_it = do_item_get(key, it->nkey, hv);
-
-    if (old_it != NULL) {
-        item_replace(old_it, it, hv);
-    } else {
+    old_it = do_item_rcu_replace(key, it->nkey, hv, it);
+    if (old_it == NULL) {
         do_item_link(it, hv);
+        r = 1;
     }
     /* unlock */
     item_mcs_unlock(hv);
 
-    /* ps_exit(&ps); */
     parsec_quiesce();
-
-    return 0;
+    return r;
 }
 
-static int
+static item *
 test_get_key(char* key, int nkey)
 {
     item *it;
 
     ps_enter(&ps);
-
     it = item_get(key, nkey);
-    if (it)
-        item_update(it);
-
     /* only safe to access before the _exit. We can invoke callback
      * function here. */
     ps_exit(&ps);
-
-    if (!it) return 0;
-
-    return 1;
+    return it;
 }
+
+static void
+bench(int *r_buf, int rn, int *w_buf, int wn)
+{
+    int i, ri, wi, ret, id = thd_local_id;
+    unsigned long n_read = 0, n_update = 0, n_cost;
+    char *op, value[V_LENGTH], key[KEY_LENGTH];
+    unsigned long long s, e, s1, e1;
+    unsigned long long curr_t, next_r, next_w;
+    unsigned long *r_cost = NULL, *w_cost = NULL;
+
+    /* prepare the value -- no real database op needed. */
+    memset(value, 1, V_LENGTH);
+    n_cost = N_OPS;
+    if (id == PRINT_THD) {
+        r_cost = calloc(n_cost, sizeof(unsigned long long));
+        w_cost = calloc(n_cost, sizeof(unsigned long long));
+        assert(r_cost && w_cost);
+        memset(r_cost, 0, sizeof(r_cost));
+        memset(w_cost, 0, sizeof(w_cost));
+    }
+    ri = wi = 0;
+    item *tit = parsec_mem_alloc(102);
+    meas_barrier(PS_NUMCORES);
+    rdtscll(next_r);
+    rdtscll(next_w);
+
+    rdtscll(s);
+    do {
+        rdtscll(curr_t);
+        if (curr_t >= next_w) {
+            rdtscll(s1);
+            i = w_buf[(wi++)%wn];
+            op = ops[i];
+            assert(*op == 'U');
+            memcpy(key, &op[1], KEY_LENGTH);
+            ret = set_key(key, KEY_LENGTH, value, V_LENGTH);
+            assert(ret);
+            next_w += wp;
+            rdtscll(e1);
+            if (id == PRINT_THD && n_update < n_cost) w_cost[n_update] = (unsigned long)(e1 - s1);
+            n_update++;
+        } else if (curr_t >= next_r) {
+            rdtscll(s1);
+            i = r_buf[(ri++)%rn];
+            op = ops[i];
+            assert(*op == 'R');
+            memcpy(key, &op[1], KEY_LENGTH);
+            ret = (int)test_get_key(key, KEY_LENGTH);
+            assert(ret);
+            next_r += rp;
+            rdtscll(e1);
+            if (id == PRINT_THD && n_read < n_cost) r_cost[n_read] = (unsigned long)(e1 - s1);
+            n_read++;
+        }
+    /* } while (n_update + n_read < N_OPS); */
+    } while (curr_t - s <= 10ULL * 2000000ULL * 1000ULL);
+    rdtscll(e);
+    /* if (id == 0) { */
+    printf("Thd %d: tot %lu ops (r %lu, u %lu) time %llu %llu cycles per op, thput %llu\n", (int)thd_local_id, n_read+n_update, n_read, n_update,
+           (e-s)/(unsigned long long)CPU_FREQ, (unsigned long long)(e-s)/(n_read + n_update), (unsigned long long)CPU_FREQ * (n_read+n_update) * 1000 / (e - s));
+    if (id == PRINT_THD) {
+        out_latency(r_cost, n_read <= n_cost? n_read: n_cost, "get request");
+        out_latency(w_cost, n_update <= n_cost? n_update: n_cost, "set request");
+        free(r_cost);
+        free(w_cost);
+    }
+}
+#endif
 
 /*
  * Worker thread: main event loop
@@ -880,26 +1097,6 @@ static void *worker_parsec(void *arg);
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#define N_OPS 10000000
-#define N_KEYS 1000000
-#define BUFFER_SIZE 30000
-
-#define KEY_LENGTH 16
-#define V_LENGTH   (KEY_LENGTH * 2)
-
-char ops[N_OPS][KEY_LENGTH + 1];
-
-#define P99_CALC
-
-#ifdef P99_CALC
-// 99 percentile
-#define N_LOG (N_OPS / PS_NUMCORES) //4M * 4 = 16 MB
-#define N_1P  (N_OPS / 100 / PS_NUMCORES)
-unsigned long p99[N_LOG];
-unsigned long p99_r[N_LOG];
-unsigned long p99_w[N_LOG];
-#endif
-
 int load_trace(void);
 void preload_keys(void);
 
@@ -911,6 +1108,7 @@ void preload_keys(void)
     char buf[KEY_LENGTH + 1], v[V_LENGTH];
     int bytes;
     char *load_file = "../mc_trace/trace_load_key";
+    unsigned long long s, e;
 
     ret = mlock(ops, N_OPS*(KEY_LENGTH + 1));
 	if (ret) {
@@ -918,20 +1116,13 @@ void preload_keys(void)
 		exit(-1);
 	}
 
-#ifdef P99_CALC
-    ret = mlock(p99, N_LOG*(sizeof(unsigned long)));
-	if (ret) {
-		printf("Cannot lock cache memory (%d). Check privilege. Exit.\n", ret);
-		exit(-1);
-	}
-#endif
-
     fd = open(load_file, O_RDONLY);
     if (fd < 0) {
         printf("cannot open file %s. Exit.\n", load_file);
         exit(-1);
     }
 
+    rdtscll(s);
     for (i = 0; i < N_KEYS; i++) {
         bytes = read(fd, buf, KEY_LENGTH + 1);
         assert(bytes == KEY_LENGTH + 1);
@@ -939,10 +1130,17 @@ void preload_keys(void)
         memcpy(v, buf, KEY_LENGTH);
         memcpy(&v[KEY_LENGTH], buf, KEY_LENGTH);
 
+#ifdef WCET
+        int t;
+        set_key(buf, KEY_LENGTH, v, V_LENGTH, &t);
+#else
         ret = set_key(buf, KEY_LENGTH, v, V_LENGTH);
         assert(ret == 0);
+#endif
     }
+    rdtscll(e);
     close(fd);
+    printf("MC: pre load key file... %s keys %d total time %llu ms\n", load_file, N_KEYS, (e-s)/(unsigned long long)CPU_FREQ);
 }
 
 int load_trace(void)
@@ -951,23 +1149,24 @@ int load_trace(void)
     int bytes;
     unsigned long i;
     char buf[KEY_LENGTH + 2];
+    unsigned long long s, e;
 
-    printf("loading trace file @%s...\n", TRACE_FILE);
     /* read the entire trace into memory. */
     fd = open(TRACE_FILE, O_RDONLY);
     if (fd < 0) {
         printf("cannot open file %s. Exit.\n", TRACE_FILE);
         exit(-1);
     }
-    
+    rdtscll(s);
     for (i = 0; i < N_OPS; i++) {
         bytes = read(fd, buf, KEY_LENGTH+2);
         assert(bytes == KEY_LENGTH + 2);
         assert(buf[KEY_LENGTH + 1] == '\n');
         memcpy(ops[i], buf, KEY_LENGTH + 1);
     }
+    rdtscll(e);
     close(fd);
-
+    printf("loading trace file @%s... ops %d total time %llu ms\n", TRACE_FILE, N_OPS, (e-s)/(unsigned long long)CPU_FREQ);
     return 0;
 }
 
@@ -985,10 +1184,28 @@ void set_smp_affinity()
  * nthreads  Number of worker event handler threads to spawn
  * main_base Event base for main thread
  */
-void memcached_thread_init(int nthreads, struct event_base *main_base) {
+void memcached_thread_init(int nthreads, struct event_base *main_base)
+{
     int         i;
     int         power;
+    int all_wp[41], all_rp[41];
 
+    memset(all_wp, -1, sizeof(all_wp));
+    memset(all_rp, -1, sizeof(all_rp));
+    all_wp[5]  = 16000;    all_rp[5]  = 2725;
+    all_wp[10] = 30000;    all_rp[10] = 5004;
+    all_wp[15] = 68000;    all_rp[15] = 12586;
+    all_wp[20] = 90000;    all_rp[20] = 17374;
+    all_wp[25] = 134000;   all_rp[25] = 25324;
+    all_wp[30] = 144000;   all_rp[30] = 31538;
+    all_wp[35] = 218000;   all_rp[35] = 42315;
+    all_wp[39] = 236000;   all_rp[39] = 50197;
+
+    wp = (unsigned long long)all_wp[nthreads];
+    rp = (unsigned long long)all_rp[nthreads];
+#ifdef SLACK_TIME
+    rp = 1;
+#endif
     pthread_mutex_init(&cache_lock, NULL);
     pthread_mutex_init(&worker_hang_lock, NULL);
 
@@ -1008,7 +1225,6 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
     } else {
         /* 8192 buckets, and central locks don't scale much past 5 threads */
         /* power = 13; */
-        
         power = 13;
     }
 
@@ -1059,6 +1275,7 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
         stats.reserved_fds += 5;
     }
 
+    thd_local_id = 0;
     set_smp_affinity();
     ps_init(&ps);
     parsec_mem_init();
@@ -1073,310 +1290,109 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
 #ifdef REAL_TIME
     printf("real time parsec\n");
 #endif
-    printf("MC: loading trace file...\n");
     preload_keys();
     load_trace();
 
-    printf("MC: creating %d worker threads\n", nthreads);
-    for (i = 0; i < nthreads; i++) {
+    printf("MC: creating %d worker threads wp %llu rp %llu\n", nthreads, wp, rp);
+    for (i = 1; i < nthreads; i++) {
         create_worker(worker_parsec, &threads[i]);
     }
-
+    worker_parsec(&threads[0]);
     /* Wait for all the threads to set themselves up before returning. */
     pthread_mutex_lock(&init_lock);
     wait_for_thread_registration(nthreads);
     pthread_mutex_unlock(&init_lock);
 }
 
-__attribute__ ((unused)) static void 
-test_test(void)
-{
-    int i, j, k, ret;
-    char aaa = 'a';
-    char aa[4];
-    char value[CACHE_LINE];
+/* __attribute__ ((unused)) static void  */
+/* test_test(void) */
+/* { */
+/*     int i, j, k, ret; */
+/*     char aaa = 'a'; */
+/*     char aa[4]; */
+/*     char value[CACHE_LINE]; */
 
-    printf("thd %d: starting set + get...\n", thd_local_id);
-    memset(value, 0, CACHE_LINE);
+/*     printf("thd %d: starting set + get...\n", thd_local_id); */
+/*     memset(value, 0, CACHE_LINE); */
 
-    aa[0] = aaa;
-    for (i = 0; i < 5; i++) {
-        aa[1] = i;
-        for (j = 0; j < 128; j++) {
-            aa[2] = j;
-            for (k = 0; k < 128; k++) {
-                aa[3] = k;
+/*     aa[0] = aaa; */
+/*     for (i = 0; i < 5; i++) { */
+/*         aa[1] = i; */
+/*         for (j = 0; j < 128; j++) { */
+/*             aa[2] = j; */
+/*             for (k = 0; k < 128; k++) { */
+/*                 aa[3] = k; */
 
-//                printf("thd %d, %d %d %d\n", thd_local_id, i,j,k);
-                ret = set_key(aa, 4, value, CACHE_LINE);
-                if (ret) printf("--------------set failed?!\n");
-            }
-        }
-        printf("thd %d, %d\n", thd_local_id, i);
-    }
-
-    printf("and counting ...\n");
-    /* browse cache content */
-    int tot = 0;
-    for (i = 0; i < 128; i++) {
-        aa[1] = i;
-        for (j = 0; j < 128; j++) {
-            aa[2] = j;
-            for (k = 0; k < 128; k++) {
-                /* printf("k %d\n", k); */
-                aa[3] = k;
-                ret = test_get_key(aa, 4);
-                if (ret) {
-                    /* count keys */
-                    tot++;
-                }
-            }
-        }
-    }
-
-    printf("Thd %d: verified tot %d keys in cache\n", thd_local_id, tot);
-
-    return;
-}
-
-#ifdef P99_CALC
-//#define AVG   (800)
-//#define THRES (2*AVG)
-static int cmpfunc(const void * a, const void * b)
-{
-    return ( *(int*)b - *(int*)a );
-}
-#endif
-
-void Divide(int n, int m, int k, int *s, int *e)
-{
-    int r = n%m, t = n/m;
-    if (k<r) {
-        t++;
-        *s = k*t;
-        *e = *s+t;
-    } else {
-        *s = r*(t+1);
-        *s = *s+(k-r)*t;
-        *e = *s+t;
-    }
-}
-
-static void 
-bench(void)
-{
-    int i, ret;
-    unsigned long n_read = 0, n_update = 0, n_tot;
-#ifdef P99_CALC
-    unsigned long n_large = 0;
-#endif
-    char *op, value[V_LENGTH], key[KEY_LENGTH];
-    int id = thd_local_id, jump = settings.num_threads, start, end;
-    unsigned long long s, e, s1, e1, tot_r = 0, tot_w = 0, max = 0, tot_cost = 0, cost;
-
-    /* prepare the value -- no real database op needed. */
-    memset(value, 1, V_LENGTH);
-    Divide(N_OPS, PS_NUMCORES, id, &start, &end);
-
-    rdtscll(s);
-
-    /* for (i = start; i < end; i++) { */
-    for (i = id; i < N_OPS; i += jump) {
-        op = ops[i];
-        memcpy(key, &op[1], KEY_LENGTH);
-
-        rdtscll(s1);        
-        if (*op == 'R') {
-            n_read++;
-
-            ret = test_get_key(key, KEY_LENGTH);
-            if (!ret) {
-                /* If get returns null, do a set. */
-                n_update++;
-                ret = set_key(key, KEY_LENGTH, value, V_LENGTH);
-                assert(ret == 0);
-            }
-        } else {
-            assert(*op == 'U');
-            n_update++;
-
-            ret = set_key(key, KEY_LENGTH, value, V_LENGTH);
-            assert(ret == 0);
-        }
-        rdtscll(e1);
-        cost = e1-s1;
-        if (*op == 'R') tot_r += cost;
-        else tot_w += cost;
-        tot_cost += cost;
-        if (cost > max) max = cost;
-#ifdef P99_CALC
-        if (id == 0 /* && cost > THRES */) {
-            p99[n_large] = cost;
-            if (n_large < N_LOG - 1) {
-                n_large++;
-            }
-            if (*op == 'R') p99_r[n_read-1] = cost;
-            else p99_w[n_update-1] = cost;
-        }
-#endif
-    }
-    rdtscll(e);
-
-/* #ifdef P99_CALC */
-/*     if (id == 1) { */
-/*         qsort(p99, n_large, sizeof(unsigned long), cmpfunc); */
-/*         qsort(p99_r, n_read, sizeof(unsigned long), cmpfunc); */
-/*         qsort(p99_w, n_update, sizeof(unsigned long), cmpfunc); */
-/*         printf("r %d w %d tot %d n1p %d log %d\n", n_read, n_update, n_large, N_1P, N_LOG); */
-/*         printf("read max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99_r[0], p99_r[n_read/100], p99_r[n_read/1000], p99_r[n_read/10000]); */
-/*         printf("update max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99_w[0], p99_w[n_update/100], p99_w[n_update/1000], p99_w[n_update/10000]); */
-/*         printf("tot max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99[0], p99[n_large/100], p99[n_large/1000], p99[n_large/10000]); */
+/* //                printf("thd %d, %d %d %d\n", thd_local_id, i,j,k); */
+/*                 ret = set_key(aa, 4, value, CACHE_LINE); */
+/*                 if (ret) printf("--------------set failed?!\n"); */
+/*             } */
+/*         } */
+/*         printf("thd %d, %d\n", thd_local_id, i); */
 /*     } */
-/* #endif */
-/*     n_tot = n_read+n_update; */
-/*     printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu, thput %llu r avg %llu w avg %llu\n", */
-/*            (int)thd_local_id, n_tot, n_read, n_update, (unsigned long long)(e-s)/n_tot, */
-/*            tot_cost/n_tot,  max, tot_cost/(unsigned long long)CPU_FREQ, (unsigned long long)CPU_FREQ * n_tot * 1000 / tot_cost, */
-/*            tot_r/n_read, tot_w/n_update); */
-}
 
-static void 
-period_bench(void)
+/*     printf("and counting ...\n"); */
+/*     /\* browse cache content *\/ */
+/*     int tot = 0; */
+/*     for (i = 0; i < 128; i++) { */
+/*         aa[1] = i; */
+/*         for (j = 0; j < 128; j++) { */
+/*             aa[2] = j; */
+/*             for (k = 0; k < 128; k++) { */
+/*                 /\* printf("k %d\n", k); *\/ */
+/*                 aa[3] = k; */
+/*                 ret = test_get_key(aa, 4); */
+/*                 if (ret) { */
+/*                     /\* count keys *\/ */
+/*                     tot++; */
+/*                 } */
+/*             } */
+/*         } */
+/*     } */
+
+/*     printf("Thd %d: verified tot %d keys in cache\n", thd_local_id, tot); */
+
+/*     return; */
+/* } */
+
+static void *worker_parsec(void *arg)
 {
-    unsigned long n_read = 0, n_update = 0, n_tot;
-#ifdef P99_CALC
-    unsigned long n_large = 0;
-#endif
-    char *op, value[V_LENGTH], key[KEY_LENGTH];
-    int id = thd_local_id, jump = settings.num_threads;
-    unsigned long long s, e, s1, e1, tot_cost = 0, max = 0, cost;
-    char **ring;
-    int i, ret = 0, head, tail, ntrace, end, left;
-    unsigned long long period, cur_time, deadline = 0, tot_r = 0, tot_w = 0;
-    int fail_cnt = 0, read = 0;
-    
-    e1 = 0;
-    head   = tail = 0;
-    ntrace = thd_local_id;
-    /* period = set_periods[thd_local_id]; */
-    period = SET_PERIOD;
-    ring = (char **)malloc(sizeof(char *)*BUFFER_SIZE);
-    /* for(i=0; i<BUFFER_SIZE; i++) ring[i] = (char *)malloc(KEY_LENGTH); */
-
-    /* prepare the value -- no real database op needed. */
-    memset(value, 1, V_LENGTH);
-    Divide(N_OPS, PS_NUMCORES, id, &ntrace, &end);
-    ntrace = id;
-    end = N_OPS;
-
-    rdtscll(s);
-    while (ntrace < end) {
-        if ((tail+1)%BUFFER_SIZE == head) printf("thd %d buffer full head %d tail %d\n", id, head, tail);
-        /* ps_mem_fence(); */        
-        rdtscll(cur_time);
-        /* if (id ==0) printf("%llu %llu\n", cur_time, deadline); */
-
-        /* reach a deadline, send set request if have any*/
-        if (cur_time+100 >= deadline && head != tail) {
-            deadline = cur_time + period;
-            n_update++;
-            read = 0;
-            rdtscll(s1);
-            ret = set_key(ring[head], KEY_LENGTH, value, V_LENGTH);
-            rdtscll(e1);
-            head = (head+1)%BUFFER_SIZE;
-            tot_w += (e1-s1);
-        } else {
-            op = ops[ntrace];
-            if (*op == 'R') {
-                /* memcpy(key, &op[1], KEY_LENGTH); */
-                read = 1;
-                n_read++;
-                rdtscll(s1);
-                /* ret = test_get_key(key, KEY_LENGTH); */
-                ret = test_get_key(&op[1], KEY_LENGTH);
-                rdtscll(e1);
-                tot_r += (e1-s1);
-            }
-            if (!ret || *op == 'U') {
-                /* memcpy(ring[tail], &op[1], KEY_LENGTH); */
-                ring[tail] = &op[1];
-                tail = (tail+1)%BUFFER_SIZE;
-                if (*op == 'U') {
-                    s1 = e1 = 0;
-                    read = -1;
-                } else fail_cnt++;
-            }
-            ntrace += jump;
-        }
-        
-        cost = e1-s1;
-        tot_cost += cost; 
-        if (cost > max) max = cost;
-#ifdef P99_CALC
-        if (id == 1 && cost) {
-            p99[n_large] = cost;
-            if (n_large < N_LOG - 1) {
-                n_large++;
-            }
-            if (read == 1) p99_r[n_read-1] = cost;
-            if (read == 0) p99_w[n_update-1] = cost;
-        }
-#endif
-    }
-    rdtscll(e);
-
-#ifdef P99_CALC
-    if (id == 1) {
-        qsort(p99, n_large, sizeof(unsigned long), cmpfunc);
-        qsort(p99_r, n_read, sizeof(unsigned long), cmpfunc);
-        qsort(p99_w, n_update, sizeof(unsigned long), cmpfunc);
-        printf("r %lu w %lu tot %lu n1p %d log %d\n", n_read, n_update, n_large, N_1P, N_LOG);
-        printf("read max %lu 99p %lu 99.9p %lu 99.99p %lu\n", 10*p99_r[0], p99_r[n_read/100], p99_r[n_read/1000], p99_r[n_read/10000]);
-        printf("update max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99_w[0], p99_w[n_update/100], p99_w[n_update/1000], p99_w[n_update/10000]);
-        printf("tot max %lu 99p %lu 99.9p %lu 99.99p %lu\n", p99[0], p99[n_large/100], p99[n_large/1000], p99[n_large/10000]);
-    }
-#endif
-    if (tail >= head) left = tail-head+1;
-    else left = tail+BUFFER_SIZE-head;
-    n_tot = n_read+n_update;
-    printf("Thd %d: tot %lu ops (r %lu, u %lu) done, %llu (%llu) cycles per op, max %llu, time(ms) %llu left %d, thput %llu r_avg %llu w_avg %llu\n",
-           (int)thd_local_id, n_tot, n_read, n_update, (unsigned long long)(e-s)/n_tot,
-           tot_cost/n_tot,  max, tot_cost/(unsigned long long)CPU_FREQ,  
-           left, (unsigned long long)CPU_FREQ *n_tot * 1000 / tot_cost, tot_r/n_read, tot_w/n_update);
-    
-    /* for(i=0; i<BUFFER_SIZE; i++) free(ring[i]); */
-    free(ring);
-}
-
-volatile int done = 0;
-static void *worker_parsec(void *arg) {
     LIBEVENT_THREAD *me = arg;
+    int id, jump = PS_NUMCORES;
+    int i, rn, wn, ri, wi;
+    int *r_buf, *w_buf;
+    char *op;
 
     thd_local_id = me->id;
-
-    sleep(1);
     thd_set_affinity(pthread_self(), thd_local_id);
-    sleep(1);
     parsec_init_thd(MR_PERIOD);
-    /* meas_barrier(PS_NUMCORES); */
-    bench();
 
-    if (thd_local_id == 0) {
-        parsec_mem_state();
-        memset(p99, 0, sizeof(p99));
-        memset(p99_r, 0, sizeof(p99_r));
-        memset(p99_w, 0, sizeof(p99_w));
+    /* if (thd_local_id == 0) { */
+    /*     parsec_mem_state(); */
+    /*     memset(p99, 0, sizeof(p99)); */
+    /*     memset(p99_r, 0, sizeof(p99_r)); */
+    /*     memset(p99_w, 0, sizeof(p99_w)); */
+    /* } */
+    id = thd_local_id;
+    rn = wn = 0;
+    for (i = id; i < N_OPS; i += jump) {
+        op = ops[i];
+        if (*op == 'R') rn++;
+        else wn++;
     }
-    sleep(3);
-    meas_barrier(PS_NUMCORES);
+    r_buf = calloc(rn, sizeof(int));
+    w_buf = calloc(wn, sizeof(int));
+    ri = wi = 0;
+    for (i = id; i < N_OPS; i += jump) {
+        op = ops[i];
+        if (*op == 'R') r_buf[ri++] = i;
+        else w_buf[wi++] = i;
+    }
+    bench(r_buf, rn, w_buf, wn);
+    free(r_buf);
+    free(w_buf);
 
-        /* bench(); */
-    period_bench();
-    sleep(2);
-    meas_barrier(PS_NUMCORES);
-    if (thd_local_id == 0) parsec_mem_state();
-
+    if (thd_local_id == PRINT_THD) parsec_mem_state();
     
     register_thread_initialized();
     

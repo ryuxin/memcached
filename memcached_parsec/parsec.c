@@ -3,10 +3,8 @@
 #define ITEM_SIZE 102
 
 __thread int thd_local_id;
-unsigned long long set_periods[PS_NUMCORES] = {2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000};
-unsigned long long quiesce_periods[PS_NUMCORES];
 struct parsec ps;
-PS_PARSLAB_CREATE(item, ITEM_SIZE, PS_PAGE_SIZE * 1)
+PS_PARSLAB_CREATE(item, ITEM_SIZE, PS_PAGE_SIZE * 512)
 
 void
 parsec_mem_init(void)
@@ -49,6 +47,7 @@ parsec_mem_state(void)
 		/* printf("core %d quis max %d curr %d\n", i, m->percore[i].smr_info.qmemmax, m->percore[i].smr_info.qmemcnt); */
 		m_tot += m->percore[i].smr_info.qmemmax;
 		c_tot += m->percore[i].smr_info.qmemcnt;
+		printf("core %d cur %d tot %d\n", i, m->percore[i].smr_info.qmemcnt, m->percore[i].smr_info.qmemmax);
 		if (m->percore[i].smr_info.qmemmax > m_max) m_max = m->percore[i].smr_info.qmemmax;
 	}
 	printf("max %d tot_max %d cur %d\n", m_max, m_tot, c_tot);

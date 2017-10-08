@@ -217,7 +217,7 @@ AUTOMAKE = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing --run 
 AWK = mawk
 CC = gcc -std=gnu99
 CCDEPMODE = depmode=gcc3
-CFLAGS = -g -O2 -pthread -pthread -Wall -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls -fno-strict-aliasing
+CFLAGS = -O2 -D__x86__ -pthread -pthread -Wall -pedantic -Wmissing-prototypes -Wmissing-declarations -Wredundant-decls -fno-strict-aliasing
 CPP = gcc -E
 CPPFLAGS = 
 CYGPATH_W = echo
@@ -239,7 +239,7 @@ INSTALL_SCRIPT = ${INSTALL}
 INSTALL_STRIP_PROGRAM = $(install_sh) -c -s
 LDFLAGS = 
 LIBOBJS = 
-LIBS = -levent -lrt ../../ps/libps.a 
+LIBS = -levent -lrt -lck ../../ps/libps.a 
 LTLIBOBJS = 
 MAKEINFO = ${SHELL} /home/ryx/research/memcached/memcached_parsec/missing --run makeinfo
 MKDIR_P = /bin/mkdir -p

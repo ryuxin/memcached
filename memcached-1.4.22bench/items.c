@@ -112,7 +112,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     item *search;
     item *next_it;
     void *hold_lock = NULL;
-    rel_time_t oldest_live = settings.oldest_live;
+    //rel_time_t oldest_live = settings.oldest_live;
 
     search = tails[id];
     /* We walk up *only* for locked items. Never searching for expired.

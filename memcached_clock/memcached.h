@@ -9,12 +9,11 @@
 #include "config.h"
 #endif
 
-#define NUM_CPU (40)
 #define TRACE_FILE "../mc_trace/trace20p_key"
 
 // for 99 percentile w/ limited memory
 #define THRES (600000)
-
+#define NUM_CPU (39)
 #define CACHE_LINE 64
 #define MEM_SIZE (512*1024*1024)
 
@@ -595,6 +594,11 @@ void item_mcs_lock(uint32_t hv);
 void item_mcs_unlock(uint32_t hv);
 void *item_try_mcslock(uint32_t hv, void *lock_context);
 void item_try_mcsunlock(void *lock, void *lock_context);
+
+void item_pfrw_read_lock(uint32_t hv);
+void item_pfrw_read_unlock(uint32_t hv);
+void item_pfrw_write_lock(uint32_t hv);
+void item_pfrw_write_unlock(uint32_t hv);
 
 void item_lock(uint32_t hv);
 void *item_trylock(uint32_t hv);

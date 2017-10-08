@@ -299,3 +299,16 @@ void stop_assoc_maintenance_thread() {
     pthread_join(maintenance_tid, NULL);
 }
 
+item *assoc_rcu_replace(const char *key, const size_t nkey, const uint32_t hv, item *it)
+{
+    item **before = _hashitem_before(key, nkey, hv);
+    if (*before) {
+        item *nxt, *old;
+        old = *before;
+        nxt = (*before)->h_next;
+        it->h_next = nxt;
+        *before = it;
+        return old;
+    }
+    return NULL;
+}
